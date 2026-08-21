@@ -3,6 +3,8 @@ const bcrypt = require('bcryptjs');
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
+const dns = require('dns').promises;
+
 const dbConfig = {
   host: process.env.DB_HOST || 'localhost',
   port: parseInt(process.env.DB_PORT || '3306', 10),
@@ -17,21 +19,50 @@ const dbConfig = {
 
 let pool = null;
 
+async function resolveHost(hostname) {
+  if (!hostname || hostname === 'localhost' || hostname === '127.0.0.1' || /^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) {
+    return hostname;
+  }
+  try {
+    dns.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4']);
+    const ips = await dns.resolve4(hostname);
+    if (ips && ips.length > 0) {
+      return ips[0];
+    }
+  } catch (err) {
+    // fallback to original hostname
+  }
+  return hostname;
+}
+
 async function getPool() {
   if (!pool) {
-    // 1. Ensure the MySQL database exists first
-    const initConnection = await mysql.createConnection({
-      host: dbConfig.host,
-      port: dbConfig.port,
-      user: dbConfig.user,
-      password: dbConfig.password
-    });
+    const rawHost = dbConfig.host;
+    const targetHost = await resolveHost(rawHost);
+    const isCloudSSL = process.env.DB_SSL === 'true' || rawHost.includes('tidbcloud.com') || rawHost.includes('aivencloud.com');
+    const sslConfig = isCloudSSL ? { servername: rawHost, rejectUnauthorized: false } : undefined;
 
-    await initConnection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
-    await initConnection.end();
+    // 1. Try to ensure the database exists (for local or root permissions)
+    try {
+      const initConnection = await mysql.createConnection({
+        host: targetHost,
+        port: dbConfig.port,
+        user: dbConfig.user,
+        password: dbConfig.password,
+        ssl: sslConfig
+      });
+      await initConnection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
+      await initConnection.end();
+    } catch (err) {
+      // On cloud/shared MySQL (e.g. Aiven, AWS, cPanel), the database is pre-created by host
+    }
 
     // 2. Create connection pool to the database
-    pool = mysql.createPool(dbConfig);
+    pool = mysql.createPool({
+      ...dbConfig,
+      host: targetHost,
+      ssl: sslConfig
+    });
   }
   return pool;
 }

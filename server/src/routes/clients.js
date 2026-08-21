@@ -34,14 +34,15 @@ router.get('/', authMiddleware, async (req, res) => {
         (SELECT COALESCE(SUM(total_paid), 0) FROM loan_records WHERE client_id = c.id) as totalAmountPaid,
         (SELECT COALESCE(SUM(remaining_amount), 0) FROM loan_records WHERE client_id = c.id) as totalOutstandingAmount
       FROM clients c
-      LEFT JOIN loan_records l ON l.id = (
-        SELECT id FROM loan_records 
-        WHERE client_id = c.id 
-        ORDER BY 
-          CASE WHEN status = 'overdue' THEN 1 WHEN status = 'active' THEN 2 ELSE 3 END ASC,
-          created_at DESC 
-        LIMIT 1
-      )
+      LEFT JOIN (
+        SELECT lr.*
+        FROM loan_records lr
+        INNER JOIN (
+          SELECT client_id, MAX(id) AS max_id
+          FROM loan_records
+          GROUP BY client_id
+        ) latest ON lr.id = latest.max_id
+      ) l ON l.client_id = c.id
       WHERE 1=1
     `;
 
