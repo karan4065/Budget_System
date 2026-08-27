@@ -1,8 +1,10 @@
 import { generateClientTransactionsCSV } from './utils/csvExport';
 
 // API service for Budget Management System
-
-const API_BASE = '/api';
+const rawApiUrl = import.meta.env.VITE_API_URL || '';
+const API_BASE = rawApiUrl 
+  ? (rawApiUrl.endsWith('/api') ? rawApiUrl : `${rawApiUrl.replace(/\/$/, '')}/api`) 
+  : '/api';
 
 function getAuthHeader() {
   const token = localStorage.getItem('budget_admin_token');
