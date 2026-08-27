@@ -1,3 +1,5 @@
+import { generateClientTransactionsCSV } from './utils/csvExport';
+
 // API service for Budget Management System
 
 const API_BASE = '/api';
@@ -79,6 +81,13 @@ export const api = {
     method: 'DELETE'
   }),
   searchClients: (query) => request(`/clients/search/${encodeURIComponent(query)}`),
+  downloadClientCSV: async (clientId) => {
+    const clientData = await api.getClient(clientId);
+    if (!clientData || !clientData.client) {
+      throw new Error('Client data could not be retrieved.');
+    }
+    generateClientTransactionsCSV(clientData.client, clientData.loanRecords || []);
+  },
 
   // Transactions
   getTransactions: (params = {}) => {

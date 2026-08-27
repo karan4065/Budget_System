@@ -1,14 +1,15 @@
 const express = require('express');
 const router = express.Router();
-const { getPool, evaluateStatus, updateAllRecordStatuses, syncLoanBalances, calculateDueDate } = require('../db');
+const mongoose = require('mongoose');
+const { evaluateStatus, syncLoanBalances, calculateDueDate, getTodayStr } = require('../db');
 const authMiddleware = require('../middleware/auth');
+const Loan = require('../models/Loan');
+const Transaction = require('../models/Transaction');
+const Client = require('../models/Client');
 
 // GET /api/transactions - Global transaction history with filters
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const db = await getPool();
-    await updateAllRecordStatuses();
-
     const {
       type,
       startDate,
@@ -18,76 +19,81 @@ router.get('/', authMiddleware, async (req, res) => {
       offset = 0
     } = req.query;
 
-    let query = `
-      SELECT 
-        t.id,
-        t.record_id as recordId,
-        t.client_id as clientId,
-        t.amount,
-        t.transaction_type as transactionType,
-        DATE_FORMAT(t.transaction_date, '%Y-%m-%d') as transactionDate,
-        t.remaining_after as remainingAfter,
-        t.payment_mode as paymentMode,
-        t.note,
-        t.created_at as createdAt,
-        c.name as clientName,
-        c.mobile_number as mobileNumber,
-        l.duration,
-        l.amount_taken as loanAmount,
-        DATE_FORMAT(l.due_date, '%Y-%m-%d') as loanDueDate,
-        l.status as loanStatus
-      FROM transactions t
-      JOIN clients c ON t.client_id = c.id
-      JOIN loan_records l ON t.record_id = l.id
-      WHERE 1=1
-    `;
-
-    const params = [];
-
+    // Build match filter
+    const match = {};
     if (type && ['payment', 'disbursement', 'penalty', 'adjustment'].includes(type)) {
-      query += ` AND t.transaction_type = ?`;
-      params.push(type);
+      match.transactionType = type;
     }
+    if (startDate) match.transactionDate = { ...match.transactionDate, $gte: startDate };
+    if (endDate) match.transactionDate = { ...match.transactionDate, $lte: endDate };
 
-    if (startDate) {
-      query += ` AND t.transaction_date >= ?`;
-      params.push(startDate);
-    }
-
-    if (endDate) {
-      query += ` AND t.transaction_date <= ?`;
-      params.push(endDate);
-    }
+    // Aggregation pipeline with client and loan joins
+    const pipeline = [
+      { $match: match },
+      { $lookup: { from: 'clients', localField: 'clientId', foreignField: '_id', as: 'client' } },
+      { $lookup: { from: 'loans', localField: 'loanId', foreignField: '_id', as: 'loan' } },
+      { $unwind: { path: '$client', preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: '$loan', preserveNullAndEmptyArrays: true } }
+    ];
 
     if (search && search.trim()) {
-      const term = `%${search.trim()}%`;
-      query += ` AND (c.name LIKE ? OR c.mobile_number LIKE ? OR t.note LIKE ?)`;
-      params.push(term, term, term);
+      const term = search.trim();
+      pipeline.push({
+        $match: {
+          $or: [
+            { 'client.name': { $regex: term, $options: 'i' } },
+            { 'client.mobileNumber': { $regex: term, $options: 'i' } },
+            { note: { $regex: term, $options: 'i' } }
+          ]
+        }
+      });
     }
 
-    query += ` ORDER BY t.transaction_date DESC, t.id DESC LIMIT ? OFFSET ?`;
-    params.push(Number(limit), Number(offset));
+    // Total count and summary (before pagination)
+    const summaryPipeline = [...pipeline, {
+      $group: {
+        _id: null,
+        totalCount: { $sum: 1 },
+        totalCollected: {
+          $sum: { $cond: [{ $eq: ['$transactionType', 'payment'] }, '$amount', 0] }
+        },
+        totalDisbursed: {
+          $sum: { $cond: [{ $eq: ['$transactionType', 'disbursement'] }, '$amount', 0] }
+        }
+      }
+    }];
 
-    const [transactions] = await db.query(query, params);
+    const [summaryResult, transactions] = await Promise.all([
+      Transaction.aggregate(summaryPipeline),
+      Transaction.aggregate([
+        ...pipeline,
+        { $sort: { transactionDate: -1, _id: -1 } },
+        { $skip: Number(offset) },
+        { $limit: Number(limit) },
+        {
+          $project: {
+            id: '$_id',
+            recordId: '$loanId',
+            clientId: 1,
+            amount: 1,
+            transactionType: 1,
+            transactionDate: 1,
+            remainingAfter: 1,
+            paymentMode: 1,
+            note: 1,
+            createdAt: 1,
+            clientName: '$client.name',
+            mobileNumber: '$client.mobileNumber',
+            duration: '$loan.duration',
+            loanAmount: '$loan.amountTaken',
+            loanDueDate: '$loan.dueDate',
+            loanStatus: '$loan.status'
+          }
+        }
+      ])
+    ]);
 
-    let countQuery = `
-      SELECT 
-        COUNT(*) as totalCount,
-        COALESCE(SUM(CASE WHEN t.transaction_type = 'payment' THEN t.amount ELSE 0 END), 0) as totalCollected,
-        COALESCE(SUM(CASE WHEN t.transaction_type = 'disbursement' THEN t.amount ELSE 0 END), 0) as totalDisbursed
-      FROM transactions t
-      JOIN clients c ON t.client_id = c.id
-      JOIN loan_records l ON t.record_id = l.id
-      WHERE 1=1
-    `;
-    const countParams = params.slice(0, -2);
-    if (countParams.length > 0) {
-      if (type) countQuery += ` AND t.transaction_type = ?`;
-      if (startDate) countQuery += ` AND t.transaction_date >= ?`;
-      if (endDate) countQuery += ` AND t.transaction_date <= ?`;
-      if (search && search.trim()) countQuery += ` AND (c.name LIKE ? OR c.mobile_number LIKE ? OR t.note LIKE ?)`;
-    }
-    const [[summary]] = await db.query(countQuery, countParams);
+    const summary = summaryResult[0] || { totalCount: 0, totalCollected: 0, totalDisbursed: 0 };
 
     return res.json({
       transactions,
@@ -109,7 +115,7 @@ router.post('/', authMiddleware, async (req, res) => {
     recordId,
     amount,
     transactionType = 'payment',
-    transactionDate = new Date().toISOString().split('T')[0],
+    transactionDate = getTodayStr(),
     paymentMode = 'Cash',
     note,
     isInterestRenewal = false,
@@ -126,86 +132,74 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 
   try {
-    const db = await getPool();
-    const [loanRows] = await db.query('SELECT * FROM loan_records WHERE id = ?', [recordId]);
-    const loan = loanRows[0];
+    if (!mongoose.Types.ObjectId.isValid(recordId)) {
+      return res.status(400).json({ error: 'Invalid loan record ID.' });
+    }
+
+    const loan = await Loan.findById(recordId);
     if (!loan) {
       return res.status(404).json({ error: 'Loan record not found.' });
     }
 
     if (transactionType === 'payment') {
-      if (Number(loan.remaining_amount) <= 0) {
+      if (Number(loan.remainingAmount) <= 0) {
         return res.status(400).json({ error: 'This loan record is already fully settled (Remaining: ₹0).' });
       }
-      if (parsedAmount > Number(loan.remaining_amount) && !isInterestRenewal) {
-        return res.status(400).json({ 
-          error: `Payment amount (₹${parsedAmount}) cannot exceed the remaining balance of ₹${Number(loan.remaining_amount)}.` 
+      if (parsedAmount > Number(loan.remainingAmount) && !isInterestRenewal) {
+        return res.status(400).json({
+          error: `Payment amount (₹${parsedAmount}) cannot exceed the remaining balance of ₹${Number(loan.remainingAmount)}.`
         });
       }
     }
 
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
+    const shouldExtend = isInterestRenewal || extendDueDate || (note && note.toLowerCase().includes('interest payment'));
+    let newDueDate = loan.dueDate;
 
-      const shouldExtend = isInterestRenewal || extendDueDate || (note && note.toLowerCase().includes('interest payment'));
-      let newDueDate = loan.due_date;
-
-      if (shouldExtend) {
-        newDueDate = calculateDueDate(loan.due_date, loan.duration);
-        await connection.query('UPDATE loan_records SET due_date = ? WHERE id = ?', [newDueDate, loan.id]);
-      }
-
-      let projectedRemaining = Number(loan.remaining_amount);
-      if (shouldExtend) {
-        // When interest renewal is paid, the renewed cycle carries Principal + 10% Interest
-        const activePrincipal = Number(loan.amount_taken);
-        const rate = Number(loan.interest_rate) || 10;
-        const newCycleInterest = Math.round(activePrincipal * (rate / 100) * 100) / 100;
-        projectedRemaining = activePrincipal + newCycleInterest;
-      } else if (transactionType === 'payment' || transactionType === 'adjustment') {
-        projectedRemaining = Math.max(0, projectedRemaining - parsedAmount);
-      } else if (transactionType === 'penalty') {
-        projectedRemaining = projectedRemaining + parsedAmount;
-      }
-
-      const finalNote = note || (shouldExtend 
-        ? `10% Interest Payment (Loan cycle renewed by +1 ${loan.duration || 'period'} to ${newDueDate})`
-        : (transactionType === 'payment' ? 'Repayment installment' : 'Adjustment'));
-
-      const [insertRes] = await connection.query(`
-        INSERT INTO transactions (record_id, client_id, amount, transaction_type, transaction_date, remaining_after, payment_mode, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        loan.id,
-        loan.client_id,
-        parsedAmount,
-        transactionType,
-        transactionDate,
-        projectedRemaining,
-        paymentMode,
-        finalNote
-      ]);
-
-      await connection.commit();
-      connection.release();
-
-      // Recalculate and synchronize exact loan balance from database
-      const syncResult = await syncLoanBalances(loan.id);
-
-      return res.status(201).json({
-        message: shouldExtend ? `Interest payment recorded! Loan cycle renewed until ${newDueDate}.` : 'Transaction recorded successfully',
-        txnId: insertRes.insertId,
-        newDueDate,
-        newTotalPaid: syncResult?.totalPaid ?? (Number(loan.total_paid) + parsedAmount),
-        newRemaining: syncResult?.remainingAmount ?? projectedRemaining,
-        newStatus: syncResult?.status || evaluateStatus(projectedRemaining, newDueDate)
-      });
-    } catch (err) {
-      await connection.rollback();
-      connection.release();
-      throw err;
+    if (shouldExtend) {
+      newDueDate = calculateDueDate(loan.dueDate, loan.duration);
+      await Loan.findByIdAndUpdate(loan._id, { dueDate: newDueDate });
     }
+
+    let projectedRemaining = Number(loan.remainingAmount);
+    if (shouldExtend) {
+      const activePrincipal = Number(loan.amountTaken);
+      const rate = Number(loan.interestRate) || 10;
+      const newCycleInterest = Math.round(activePrincipal * (rate / 100) * 100) / 100;
+      projectedRemaining = activePrincipal + newCycleInterest;
+    } else if (transactionType === 'payment' || transactionType === 'adjustment') {
+      projectedRemaining = Math.max(0, projectedRemaining - parsedAmount);
+    } else if (transactionType === 'penalty') {
+      projectedRemaining = projectedRemaining + parsedAmount;
+    }
+
+    const finalNote = note || (shouldExtend
+      ? `10% Interest Payment (Loan cycle renewed by +1 ${loan.duration || 'period'} to ${newDueDate})`
+      : (transactionType === 'payment' ? 'Repayment installment' : 'Adjustment'));
+
+    const txn = await Transaction.create({
+      loanId: loan._id,
+      clientId: loan.clientId,
+      amount: parsedAmount,
+      transactionType,
+      transactionDate,
+      remainingAfter: projectedRemaining,
+      paymentMode,
+      note: finalNote
+    });
+
+    // Recalculate exact loan balance from all transactions
+    const syncResult = await syncLoanBalances(loan._id);
+
+    return res.status(201).json({
+      message: shouldExtend
+        ? `Interest payment recorded! Loan cycle renewed until ${newDueDate}.`
+        : 'Transaction recorded successfully',
+      txnId: txn._id.toString(),
+      newDueDate,
+      newTotalPaid: syncResult?.totalPaid ?? (Number(loan.totalPaid) + parsedAmount),
+      newRemaining: syncResult?.remainingAmount ?? projectedRemaining,
+      newStatus: syncResult?.status || evaluateStatus(projectedRemaining, newDueDate)
+    });
   } catch (err) {
     console.error('Error adding transaction:', err);
     return res.status(500).json({ error: 'Failed to record transaction: ' + err.message });
@@ -218,9 +212,11 @@ router.put('/:id', authMiddleware, async (req, res) => {
   const { amount, paymentMode, note, transactionDate } = req.body;
 
   try {
-    const db = await getPool();
-    const [rows] = await db.query('SELECT * FROM transactions WHERE id = ?', [txnId]);
-    const txn = rows[0];
+    if (!mongoose.Types.ObjectId.isValid(txnId)) {
+      return res.status(400).json({ error: 'Invalid transaction ID.' });
+    }
+
+    const txn = await Transaction.findById(txnId);
     if (!txn) {
       return res.status(404).json({ error: 'Transaction not found.' });
     }
@@ -230,19 +226,14 @@ router.put('/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Amount must be greater than 0.' });
     }
 
-    await db.query(`
-      UPDATE transactions
-      SET amount = ?, payment_mode = ?, note = ?, transaction_date = ?
-      WHERE id = ?
-    `, [
-      parsedAmount,
-      paymentMode || txn.payment_mode,
-      note !== undefined ? note : txn.note,
-      transactionDate || txn.transaction_date,
-      txnId
-    ]);
+    await Transaction.findByIdAndUpdate(txnId, {
+      amount: parsedAmount,
+      paymentMode: paymentMode || txn.paymentMode,
+      note: note !== undefined ? note : txn.note,
+      transactionDate: transactionDate || txn.transactionDate
+    });
 
-    const syncResult = await syncLoanBalances(txn.record_id);
+    const syncResult = await syncLoanBalances(txn.loanId);
 
     return res.json({
       message: 'Transaction updated successfully',
@@ -258,21 +249,23 @@ router.put('/:id', authMiddleware, async (req, res) => {
 router.delete('/:id', authMiddleware, async (req, res) => {
   const txnId = req.params.id;
   try {
-    const db = await getPool();
-    const [txnRows] = await db.query('SELECT * FROM transactions WHERE id = ?', [txnId]);
-    const txn = txnRows[0];
+    if (!mongoose.Types.ObjectId.isValid(txnId)) {
+      return res.status(400).json({ error: 'Invalid transaction ID.' });
+    }
 
+    const txn = await Transaction.findById(txnId);
     if (!txn) {
       return res.status(404).json({ error: 'Transaction not found.' });
     }
 
-    if (txn.transaction_type === 'disbursement') {
+    if (txn.transactionType === 'disbursement') {
       return res.status(400).json({ error: 'Initial loan disbursement cannot be deleted directly without deleting the loan.' });
     }
 
-    await db.query('DELETE FROM transactions WHERE id = ?', [txnId]);
+    const loanId = txn.loanId;
+    await Transaction.findByIdAndDelete(txnId);
 
-    const syncResult = await syncLoanBalances(txn.record_id);
+    const syncResult = await syncLoanBalances(loanId);
 
     return res.json({
       message: 'Transaction deleted and loan balance recalculated successfully.',

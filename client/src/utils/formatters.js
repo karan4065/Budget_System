@@ -140,3 +140,55 @@ export function getDueStatusInfo(dueDateStr, remainingAmount) {
     };
   }
 }
+
+export function calculateOverdueDetails(principalAmount, rate = 10, dueDateStr, totalPaid = 0, penalties = 0, adjustments = 0) {
+  const principal = parseFloat(principalAmount) || 0;
+  const interestRate = Number(rate) || 10;
+  const baseInterest = Math.round(principal * (interestRate / 100) * 100) / 100;
+  
+  if (!dueDateStr) {
+    return {
+      principal,
+      interestRate,
+      baseInterest,
+      daysOverdue: 0,
+      overdueWeeks: 0,
+      overdueInterest: 0,
+      totalInterest: baseInterest,
+      totalPayable: principal + baseInterest + penalties - adjustments,
+      remainingAmount: Math.max(0, principal + baseInterest + penalties - adjustments - totalPaid),
+      isOverdue: false
+    };
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const due = new Date(dueDateStr);
+  due.setHours(0, 0, 0, 0);
+
+  const diffTime = today.getTime() - due.getTime();
+  const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+  const isOverdue = diffDays > 0;
+  const daysOverdue = Math.max(0, diffDays);
+  const overdueWeeks = isOverdue ? Math.ceil(daysOverdue / 7) : 0;
+  const overdueInterest = overdueWeeks * baseInterest;
+  const totalInterest = baseInterest + overdueInterest;
+  const totalPayable = principal + totalInterest + penalties - adjustments;
+  const remainingAmount = Math.max(0, totalPayable - totalPaid);
+
+  return {
+    principal,
+    interestRate,
+    baseInterest,
+    daysOverdue,
+    overdueWeeks,
+    overdueInterest,
+    totalInterest,
+    totalPayable,
+    remainingAmount,
+    isOverdue: isOverdue && remainingAmount > 0
+  };
+}
+
+

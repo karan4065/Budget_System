@@ -1,194 +1,204 @@
 const express = require('express');
 const router = express.Router();
-const { getPool, updateAllRecordStatuses } = require('../db');
+const { syncAllLoanBalances, getTodayStr } = require('../db');
 const authMiddleware = require('../middleware/auth');
+const Client = require('../models/Client');
+const Loan = require('../models/Loan');
+const Transaction = require('../models/Transaction');
+const Reminder = require('../models/Reminder');
 
 // GET /api/dashboard/stats
 router.get('/stats', authMiddleware, async (req, res) => {
   try {
-    const db = await getPool();
-    // Sync all balances & statuses based on actual transactions and dates
-    await updateAllRecordStatuses();
+    // Sync all loan balances and statuses before computing stats
+    await syncAllLoanBalances();
 
-    const todayObj = new Date();
-    const todayStr = todayObj.toISOString().split('T')[0];
-    
-    const tomorrowObj = new Date(todayObj);
-    tomorrowObj.setDate(tomorrowObj.getDate() + 1);
-    const tomorrowStr = tomorrowObj.toISOString().split('T')[0];
+    const todayStr = getTodayStr();
+    const todayDate = new Date(todayStr + 'T00:00:00');
+    const tomorrowDate = new Date(todayDate);
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth()+1).padStart(2,'0')}-${String(tomorrowDate.getDate()).padStart(2,'0')}`;
+    const next7Date = new Date(todayDate);
+    next7Date.setDate(next7Date.getDate() + 7);
+    const next7DaysStr = `${next7Date.getFullYear()}-${String(next7Date.getMonth()+1).padStart(2,'0')}-${String(next7Date.getDate()).padStart(2,'0')}`;
 
-    const next7DaysObj = new Date(todayObj);
-    next7DaysObj.setDate(next7DaysObj.getDate() + 7);
-    const next7DaysStr = next7DaysObj.toISOString().split('T')[0];
+    // ── Basic totals ──────────────────────────────────────────────────────────
+    const [totalClients, recordsAgg, txnAgg, reminderAgg] = await Promise.all([
+      Client.countDocuments(),
+      Loan.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalRecords: { $sum: 1 },
+            activeRecords: { $sum: { $cond: [{ $and: [{ $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'overdue'] }, { $ne: ['$status', 'completed'] }] }, 1, 0] } },
+            completedRecords: { $sum: { $cond: [{ $or: [{ $eq: ['$remainingAmount', 0] }, { $eq: ['$status', 'completed'] }] }, 1, 0] } },
+            overdueRecords: { $sum: { $cond: [{ $eq: ['$status', 'overdue'] }, 1, 0] } },
+            dueTodayRecords: { $sum: { $cond: [{ $and: [{ $eq: ['$dueDate', todayStr] }, { $gt: ['$remainingAmount', 0] }] }, 1, 0] } },
+            dueTomorrowRecords: { $sum: { $cond: [{ $and: [{ $eq: ['$dueDate', tomorrowStr] }, { $gt: ['$remainingAmount', 0] }] }, 1, 0] } },
+            totalAmountGiven: { $sum: '$amountTaken' },
+            totalInterestAmount: { $sum: '$interestAmount' },
+            totalPayableAmount: { $sum: '$totalPayable' },
+            totalAmountCollected: { $sum: '$totalPaid' },
+            totalOutstandingAmount: { $sum: '$remainingAmount' },
+            // Duration breakdowns
+            weeklyClients: { $addToSet: { $cond: [{ $and: [{ $eq: ['$duration', 'weekly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$clientId', null] } },
+            weeklyCount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'weekly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, 1, 0] } },
+            weeklyAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'weekly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } },
+            fortnightClients: { $addToSet: { $cond: [{ $and: [{ $eq: ['$duration', 'fortnight'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$clientId', null] } },
+            fortnightCount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'fortnight'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, 1, 0] } },
+            fortnightAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'fortnight'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } },
+            monthlyClients: { $addToSet: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$clientId', null] } },
+            monthlyCount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, 1, 0] } },
+            monthlyAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } }
+          }
+        }
+      ]),
+      Transaction.aggregate([
+        { $match: { transactionType: 'payment' } },
+        { $group: { _id: null, totalCollectedFromTxns: { $sum: '$amount' } } }
+      ]),
+      Reminder.aggregate([
+        { $group: {
+          _id: null,
+          totalReminders: { $sum: 1 },
+          sentCount: { $sum: { $cond: [{ $eq: ['$status', 'sent'] }, 1, 0] } },
+          failedCount: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } }
+        }}
+      ])
+    ]);
 
-    // Basic totals
-    const [[{ totalClients }]] = await db.query('SELECT COUNT(*) as totalClients FROM clients');
+    const stats = recordsAgg[0] || {};
+    const totalAmountGiven = Number(stats.totalAmountGiven) || 0;
+    const totalInterest = Number(stats.totalInterestAmount) || Math.round(totalAmountGiven * 0.10 * 100) / 100;
+    const totalPayable = Number(stats.totalPayableAmount) || (totalAmountGiven + totalInterest);
+    const totalAmountCollected = Number(txnAgg[0]?.totalCollectedFromTxns) || 0;
+    const totalOutstandingAmount = Number(stats.totalOutstandingAmount) || 0;
+    const reminderCounts = reminderAgg[0] || {};
 
-    const [[recordsStats]] = await db.query(`
-      SELECT
-        COUNT(*) as totalRecords,
-        SUM(CASE WHEN remaining_amount > 0 AND status != 'overdue' THEN 1 ELSE 0 END) as activeRecords,
-        SUM(CASE WHEN remaining_amount = 0 OR status = 'completed' THEN 1 ELSE 0 END) as completedRecords,
-        SUM(CASE WHEN status = 'overdue' THEN 1 ELSE 0 END) as overdueRecords,
-        SUM(CASE WHEN DATE_FORMAT(due_date, '%Y-%m-%d') = ? AND remaining_amount > 0 THEN 1 ELSE 0 END) as dueTodayRecords,
-        SUM(CASE WHEN DATE_FORMAT(due_date, '%Y-%m-%d') = ? AND remaining_amount > 0 THEN 1 ELSE 0 END) as dueTomorrowRecords,
-        COALESCE(SUM(amount_taken), 0) as totalAmountGiven,
-        COALESCE(SUM(interest_amount), 0) as totalInterestAmount,
-        COALESCE(SUM(total_payable), 0) as totalPayableAmount,
-        COALESCE(SUM(total_paid), 0) as totalAmountCollected,
-        COALESCE(SUM(remaining_amount), 0) as totalOutstandingAmount,
-        COUNT(DISTINCT CASE WHEN duration = 'weekly' AND remaining_amount > 0 AND status != 'completed' THEN client_id END) as weeklyClients,
-        SUM(CASE WHEN duration = 'weekly' AND remaining_amount > 0 AND status != 'completed' THEN 1 ELSE 0 END) as weeklyCount,
-        COALESCE(SUM(CASE WHEN duration = 'weekly' AND remaining_amount > 0 AND status != 'completed' THEN amount_taken ELSE 0 END), 0) as weeklyAmount,
-        COUNT(DISTINCT CASE WHEN duration = 'fortnight' AND remaining_amount > 0 AND status != 'completed' THEN client_id END) as fortnightClients,
-        SUM(CASE WHEN duration = 'fortnight' AND remaining_amount > 0 AND status != 'completed' THEN 1 ELSE 0 END) as fortnightCount,
-        COALESCE(SUM(CASE WHEN duration = 'fortnight' AND remaining_amount > 0 AND status != 'completed' THEN amount_taken ELSE 0 END), 0) as fortnightAmount,
-        COUNT(DISTINCT CASE WHEN duration = 'monthly' AND remaining_amount > 0 AND status != 'completed' THEN client_id END) as monthlyClients,
-        SUM(CASE WHEN duration = 'monthly' AND remaining_amount > 0 AND status != 'completed' THEN 1 ELSE 0 END) as monthlyCount,
-        COALESCE(SUM(CASE WHEN duration = 'monthly' AND remaining_amount > 0 AND status != 'completed' THEN amount_taken ELSE 0 END), 0) as monthlyAmount
-      FROM loan_records
-    `, [todayStr, tomorrowStr]);
+    // ── Overdue records ───────────────────────────────────────────────────────
+    const rawOverdueLoans = await Loan.find({ status: 'overdue', remainingAmount: { $gt: 0 } })
+      .populate('clientId', 'name mobileNumber clientNo')
+      .sort({ dueDate: 1 })
+      .limit(20)
+      .lean();
 
-    // Total collected directly from payment transactions for absolute single-source truth
-    const [[txnStats]] = await db.query(`
-      SELECT COALESCE(SUM(amount), 0) as totalCollectedFromTxns
-      FROM transactions
-      WHERE transaction_type = 'payment'
-    `);
-
-    // WhatsApp Reminder Counts
-    const [[reminderCounts]] = await db.query(`
-      SELECT
-        COUNT(*) as totalReminders,
-        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) as sentCount,
-        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failedCount
-      FROM reminder_logs
-    `);
-
-    const totalAmountGiven = Number(recordsStats.totalAmountGiven) || 0;
-    const totalInterest = Number(recordsStats.totalInterestAmount) || Math.round(totalAmountGiven * 0.10 * 100) / 100;
-    const totalPayable = Number(recordsStats.totalPayableAmount) || (totalAmountGiven + totalInterest);
-    const totalAmountCollected = Number(txnStats.totalCollectedFromTxns) || 0;
-    const totalOutstandingAmount = Number(recordsStats.totalOutstandingAmount) || 0;
-
-    // Overdue records details for urgent attention
-    const [overdueRecords] = await db.query(`
-      SELECT 
-        l.id as recordId,
-        l.amount_taken as amountTaken,
-        l.interest_amount as interestAmount,
-        l.total_payable as totalPayable,
-        l.remaining_amount as remainingAmount,
-        l.duration,
-        DATE_FORMAT(l.start_date, '%Y-%m-%d') as startDate,
-        DATE_FORMAT(l.due_date, '%Y-%m-%d') as dueDate,
-        l.status,
-        c.id as clientId,
-        c.name as clientName,
-        c.mobile_number as mobileNumber
-      FROM loan_records l
-      JOIN clients c ON l.client_id = c.id
-      WHERE l.status = 'overdue' AND l.remaining_amount > 0
-      ORDER BY l.due_date ASC
-      LIMIT 10
-    `);
-
-    // Upcoming dues in the next 7 days
-    const [upcomingDues] = await db.query(`
-      SELECT 
-        l.id as recordId,
-        l.amount_taken as amountTaken,
-        l.interest_amount as interestAmount,
-        l.total_payable as totalPayable,
-        l.remaining_amount as remainingAmount,
-        l.duration,
-        DATE_FORMAT(l.start_date, '%Y-%m-%d') as startDate,
-        DATE_FORMAT(l.due_date, '%Y-%m-%d') as dueDate,
-        l.status,
-        c.id as clientId,
-        c.name as clientName,
-        c.mobile_number as mobileNumber
-      FROM loan_records l
-      JOIN clients c ON l.client_id = c.id
-      WHERE l.status = 'active' AND l.remaining_amount > 0 AND l.due_date BETWEEN ? AND ?
-      ORDER BY l.due_date ASC
-      LIMIT 10
-    `, [todayStr, next7DaysStr]);
-
-    // Recent transactions
-    const [recentTransactions] = await db.query(`
-      SELECT 
-        t.id,
-        t.record_id as recordId,
-        t.client_id as clientId,
-        t.amount,
-        t.transaction_type as transactionType,
-        DATE_FORMAT(t.transaction_date, '%Y-%m-%d') as transactionDate,
-        t.remaining_after as remainingAfter,
-        t.note,
-        t.payment_mode as paymentMode,
-        c.name as clientName,
-        c.mobile_number as mobileNumber
-      FROM transactions t
-      JOIN clients c ON t.client_id = c.id
-      ORDER BY t.transaction_date DESC, t.id DESC
-      LIMIT 8
-    `);
-
-    // Recent reminders
-    const [recentReminders] = await db.query(`
-      SELECT 
-        r.id,
-        r.loan_id as loanId,
-        r.client_id as clientId,
-        r.phone_number as phoneNumber,
-        r.reminder_type as reminderType,
-        DATE_FORMAT(r.due_date, '%Y-%m-%d') as dueDate,
-        r.amount,
-        r.message,
-        r.status,
-        r.sent_at as sentAt,
-        r.error_message as errorMessage,
-        c.name as clientName
-      FROM reminder_logs r
-      JOIN clients c ON r.client_id = c.id
-      ORDER BY r.sent_at DESC
-      LIMIT 6
-    `);
-
-    // Duration distribution metrics
-    const durationBreakdown = [
-      { 
-        name: 'Weekly (7 Days)', 
-        count: recordsStats.weeklyClients || 0, 
-        loanCount: recordsStats.weeklyCount || 0, 
-        amount: Number(recordsStats.weeklyAmount) || 0, 
-        key: 'weekly' 
-      },
-      { 
-        name: 'Fortnight (14 Days)', 
-        count: recordsStats.fortnightClients || 0, 
-        loanCount: recordsStats.fortnightCount || 0, 
-        amount: Number(recordsStats.fortnightAmount) || 0, 
-        key: 'fortnight' 
-      },
-      { 
-        name: 'Monthly (30 Days)', 
-        count: recordsStats.monthlyClients || 0, 
-        loanCount: recordsStats.monthlyCount || 0, 
-        amount: Number(recordsStats.monthlyAmount) || 0, 
-        key: 'monthly' 
+    const overdueRecords = rawOverdueLoans.map(loan => {
+      const client = loan.clientId || {};
+      const principal = Number(loan.amountTaken) || 0;
+      const rate = Number(loan.interestRate) || 10.00;
+      const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
+      const dueDate = loan.dueDate || '';
+      let daysOverdue = 0, overdueWeeks = 0;
+      if (dueDate && todayStr > dueDate) {
+        const d1 = new Date(dueDate + 'T00:00:00');
+        daysOverdue = Math.max(0, Math.floor((todayDate - d1) / (1000 * 60 * 60 * 24)));
+        overdueWeeks = Math.ceil(daysOverdue / 7);
       }
+      return {
+        recordId: loan._id.toString(),
+        amountTaken: principal,
+        interestRate: rate,
+        interestAmount: Number(loan.interestAmount) || 0,
+        totalPayable: Number(loan.totalPayable) || 0,
+        remainingAmount: Number(loan.remainingAmount) || 0,
+        duration: loan.duration,
+        startDate: loan.startDate,
+        dueDate,
+        status: loan.status,
+        clientId: client._id?.toString(),
+        clientNo: client.clientNo,
+        clientName: client.name,
+        mobileNumber: client.mobileNumber,
+        baseInterest, daysOverdue, overdueWeeks, overdueInterest: overdueWeeks * baseInterest
+      };
+    });
+
+    // ── Upcoming dues ─────────────────────────────────────────────────────────
+    const upcomingLoans = await Loan.find({
+      status: 'active',
+      remainingAmount: { $gt: 0 },
+      dueDate: { $gte: todayStr, $lte: next7DaysStr }
+    }).populate('clientId', 'name mobileNumber').sort({ dueDate: 1 }).limit(10).lean();
+
+    const upcomingDues = upcomingLoans.map(loan => {
+      const client = loan.clientId || {};
+      return {
+        recordId: loan._id.toString(),
+        amountTaken: Number(loan.amountTaken),
+        interestAmount: Number(loan.interestAmount),
+        totalPayable: Number(loan.totalPayable),
+        remainingAmount: Number(loan.remainingAmount),
+        duration: loan.duration,
+        startDate: loan.startDate,
+        dueDate: loan.dueDate,
+        status: loan.status,
+        clientId: client._id?.toString(),
+        clientName: client.name,
+        mobileNumber: client.mobileNumber
+      };
+    });
+
+    // ── Recent transactions ───────────────────────────────────────────────────
+    const recentTxns = await Transaction.find()
+      .populate('clientId', 'name mobileNumber')
+      .sort({ transactionDate: -1, _id: -1 })
+      .limit(8)
+      .lean();
+
+    const recentTransactions = recentTxns.map(t => {
+      const client = t.clientId || {};
+      return {
+        id: t._id.toString(),
+        recordId: t.loanId?.toString(),
+        clientId: t.clientId?._id?.toString(),
+        amount: Number(t.amount),
+        transactionType: t.transactionType,
+        transactionDate: t.transactionDate,
+        remainingAfter: Number(t.remainingAfter),
+        note: t.note,
+        paymentMode: t.paymentMode,
+        clientName: client.name,
+        mobileNumber: client.mobileNumber
+      };
+    });
+
+    // ── Recent reminders ──────────────────────────────────────────────────────
+    const recentReminderDocs = await Reminder.find()
+      .populate('clientId', 'name')
+      .sort({ sentAt: -1 })
+      .limit(6)
+      .lean();
+
+    const recentReminders = recentReminderDocs.map(r => ({
+      id: r._id.toString(),
+      loanId: r.loanId?.toString(),
+      clientId: r.clientId?._id?.toString(),
+      phoneNumber: r.phoneNumber,
+      reminderType: r.reminderType,
+      dueDate: r.dueDate,
+      amount: Number(r.amount),
+      message: r.message,
+      status: r.status,
+      sentAt: r.sentAt,
+      errorMessage: r.errorMessage,
+      clientName: r.clientId?.name || 'Client'
+    }));
+
+    // ── Duration breakdown ────────────────────────────────────────────────────
+    const durationBreakdown = [
+      { name: 'Weekly (7 Days)', count: (stats.weeklyClients || []).filter(Boolean).length, loanCount: stats.weeklyCount || 0, amount: Number(stats.weeklyAmount) || 0, key: 'weekly' },
+      { name: 'Fortnight (14 Days)', count: (stats.fortnightClients || []).filter(Boolean).length, loanCount: stats.fortnightCount || 0, amount: Number(stats.fortnightAmount) || 0, key: 'fortnight' },
+      { name: 'Monthly (30 Days)', count: (stats.monthlyClients || []).filter(Boolean).length, loanCount: stats.monthlyCount || 0, amount: Number(stats.monthlyAmount) || 0, key: 'monthly' }
     ];
 
     return res.json({
       totalClients: totalClients || 0,
-      totalRecords: recordsStats.totalRecords || 0,
-      activeRecords: recordsStats.activeRecords || 0,
-      completedRecords: recordsStats.completedRecords || 0,
-      overdueRecordsCount: recordsStats.overdueRecords || 0,
-      dueTodayCount: recordsStats.dueTodayRecords || 0,
-      dueTomorrowCount: recordsStats.dueTomorrowRecords || 0,
+      totalRecords: stats.totalRecords || 0,
+      activeRecords: stats.activeRecords || 0,
+      completedRecords: stats.completedRecords || 0,
+      overdueRecordsCount: stats.overdueRecords || 0,
+      dueTodayCount: stats.dueTodayRecords || 0,
+      dueTomorrowCount: stats.dueTomorrowRecords || 0,
       totalAmountGiven,
       totalPrincipal: totalAmountGiven,
       totalInterest,
@@ -196,9 +206,9 @@ router.get('/stats', authMiddleware, async (req, res) => {
       totalAmountCollected,
       totalRevenue: totalAmountCollected - totalAmountGiven,
       totalOutstandingAmount,
-      whatsappSentCount: Number(reminderCounts?.sentCount || 0),
-      whatsappFailedCount: Number(reminderCounts?.failedCount || 0),
-      totalRemindersCount: Number(reminderCounts?.totalReminders || 0),
+      whatsappSentCount: Number(reminderCounts.sentCount || 0),
+      whatsappFailedCount: Number(reminderCounts.failedCount || 0),
+      totalRemindersCount: Number(reminderCounts.totalReminders || 0),
       durationBreakdown,
       overdueRecords,
       upcomingDues,

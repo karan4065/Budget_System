@@ -3,7 +3,8 @@ const cors = require('cors');
 const path = require('path');
 require('dotenv').config();
 
-const { initializeDatabase } = require('./db');
+const { connectDB } = require('./config/db');
+const { seedAdmin } = require('./db');
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const clientRoutes = require('./routes/clients');
@@ -47,7 +48,7 @@ app.use('/api/reminders', reminderRoutes);
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    system: 'Budget Management Admin System (MySQL)',
+    system: 'Budget Management Admin System (MongoDB)',
     timestamp: new Date().toISOString()
   });
 });
@@ -57,14 +58,10 @@ const clientDistPath = path.join(__dirname, '..', '..', 'client', 'dist');
 app.use(express.static(clientDistPath));
 
 app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api')) {
-    return next();
-  }
+  if (req.path.startsWith('/api')) return next();
   const indexHtml = path.join(clientDistPath, 'index.html');
   res.sendFile(indexHtml, (err) => {
-    if (err) {
-      res.status(404).send('Budget Management System API is running.');
-    }
+    if (err) res.status(404).send('Budget Management System API is running.');
   });
 });
 
@@ -75,13 +72,19 @@ app.use((err, req, res, next) => {
 });
 
 async function startServer() {
-  await initializeDatabase();
+  // Connect to MongoDB first — will exit if MONGODB_URI is missing or connection fails
+  await connectDB();
+
+  // Seed single admin account if not present
+  await seedAdmin();
+
+  // Start WhatsApp reminder cron scheduler
   startScheduler();
 
   app.listen(PORT, () => {
     console.log(`🚀 Budget Management Server running on http://localhost:${PORT}`);
-    console.log(`🗄️ Connected to MySQL database "${process.env.DB_NAME || 'budget_system'}"`);
-    console.log(`🔒 Single Admin Login: ${process.env.ADMIN_EMAIL || 'sumit@gmail.com'}`);
+    console.log(`🗄️  Database: MongoDB Atlas`);
+    console.log(`🔒 Admin: ${process.env.ADMIN_EMAIL || 'sumit@gmail.com'}`);
   });
 }
 

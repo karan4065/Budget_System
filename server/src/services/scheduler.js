@@ -1,6 +1,8 @@
 const cron = require('node-cron');
-const { getPool, syncAllLoanBalances } = require('../db');
+const { syncAllLoanBalances, getTodayStr } = require('../db');
 const { sendWhatsAppMessage, logReminder, normalizePhoneNumber } = require('./whatsapp');
+const Loan = require('../models/Loan');
+const Reminder = require('../models/Reminder');
 
 /**
  * Executes a full reminder sweep across all active and unpaid loans.
@@ -14,46 +16,27 @@ async function runReminderSweep() {
   let failedCount = 0;
 
   try {
-    const db = await getPool();
     // Ensure all loan balances and statuses are up to date
     await syncAllLoanBalances();
 
-    // Query active loans with remaining balance
-    const [loans] = await db.query(`
-      SELECT 
-        lr.id as loan_id,
-        lr.client_id,
-        lr.amount_taken,
-        lr.interest_amount,
-        lr.total_payable,
-        lr.total_paid,
-        lr.remaining_amount,
-        lr.duration,
-        lr.start_date,
-        lr.due_date,
-        lr.status as loan_status,
-        c.name as client_name,
-        c.mobile_number
-      FROM loan_records lr
-      JOIN clients c ON lr.client_id = c.id
-      WHERE lr.remaining_amount > 0 AND lr.status != 'completed'
-    `);
+    // Query active/overdue loans with remaining balance, populate client info
+    const loans = await Loan.find({ remainingAmount: { $gt: 0 }, status: { $ne: 'completed' } })
+      .populate('clientId', 'name mobileNumber')
+      .lean();
 
     checkedCount = loans.length;
 
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+    const todayStr = getTodayStr();
+    const todayDate = new Date(todayStr + 'T00:00:00');
+    const tomorrowDate = new Date(todayDate);
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth()+1).padStart(2,'0')}-${String(tomorrowDate.getDate()).padStart(2,'0')}`;
 
     for (const loan of loans) {
-      const loanDueDate = new Date(loan.due_date);
-      const dueDateStr = isNaN(loanDueDate.getTime()) ? String(loan.due_date) : loanDueDate.toISOString().split('T')[0];
+      const client = loan.clientId || {};
+      const dueDateStr = loan.dueDate || '';
 
       let reminderType = null;
-
       if (dueDateStr === tomorrowStr) {
         reminderType = 'due_tomorrow';
       } else if (dueDateStr === todayStr) {
@@ -62,49 +45,66 @@ async function runReminderSweep() {
         reminderType = 'overdue';
       }
 
-      // If due date is not tomorrow, today, or overdue, skip
+      // If not due tomorrow, today, or overdue — skip
       if (!reminderType) {
         skippedCount++;
         continue;
       }
 
-      // Check if a reminder for this loan, reminder type, and due date has already been successfully sent
-      const [existingSent] = await db.query(`
-        SELECT id FROM reminder_logs
-        WHERE loan_id = ? AND reminder_type = ? AND due_date = ? AND status = 'sent'
-        LIMIT 1
-      `, [loan.loan_id, reminderType, dueDateStr]);
+      // Check if a reminder for this loan, reminder type, and due date was already sent
+      const existingSent = await Reminder.findOne({
+        loanId: loan._id,
+        reminderType,
+        dueDate: dueDateStr,
+        status: 'sent'
+      });
 
-      if (existingSent && existingSent.length > 0) {
+      if (existingSent) {
         skippedCount++;
         continue;
       }
 
-      const formattedDueDate = loanDueDate.toLocaleDateString('en-IN', {
-        day: 'numeric',
-        month: 'short',
-        year: 'numeric'
-      });
+      // Calculate overdue info for message
+      let daysOverdue = 0;
+      let overdueWeeks = 0;
+      const principal = Number(loan.amountTaken) || 0;
+      const rate = Number(loan.interestRate) || 10;
+      const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
+
+      if (reminderType === 'overdue' && dueDateStr) {
+        const d1 = new Date(dueDateStr + 'T00:00:00');
+        daysOverdue = Math.max(0, Math.floor((todayDate - d1) / (1000 * 60 * 60 * 24)));
+        overdueWeeks = Math.ceil(daysOverdue / 7);
+      }
+      const overdueInterest = overdueWeeks * baseInterest;
+
+      const formattedDueDate = dueDateStr
+        ? new Date(dueDateStr + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+        : 'the scheduled date';
 
       // Send WhatsApp message
       const sendResult = await sendWhatsAppMessage({
-        to: loan.mobile_number,
+        to: client.mobileNumber,
         reminderType,
-        clientName: loan.client_name,
-        amount: loan.remaining_amount,
-        dueDate: formattedDueDate
+        clientName: client.name,
+        amount: loan.remainingAmount,
+        dueDate: formattedDueDate,
+        daysOverdue,
+        overdueWeeks,
+        overdueInterest,
+        principal
       });
 
-      const normalizedRecipient = normalizePhoneNumber(loan.mobile_number) || loan.mobile_number;
+      const normalizedRecipient = normalizePhoneNumber(client.mobileNumber) || client.mobileNumber;
 
       // Log reminder attempt
       await logReminder({
-        loanId: loan.loan_id,
-        clientId: loan.client_id,
+        loanId: loan._id,
+        clientId: loan.clientId?._id || loan.clientId,
         phoneNumber: normalizedRecipient,
         reminderType,
         dueDate: dueDateStr,
-        amount: loan.remaining_amount,
+        amount: loan.remainingAmount,
         message: sendResult.messageText,
         status: sendResult.success ? 'sent' : 'failed',
         whatsappMessageId: sendResult.messageId || null,
@@ -113,39 +113,26 @@ async function runReminderSweep() {
 
       if (sendResult.success) {
         sentCount++;
-        console.log(`[Scheduler] ✉️ Sent ${reminderType} reminder to ${loan.client_name} (${normalizedRecipient}) for Loan #${loan.loan_id}`);
+        console.log(`[Scheduler] ✉️  Sent ${reminderType} reminder to ${client.name} (${normalizedRecipient}) for Loan #${loan._id}`);
       } else {
         failedCount++;
-        console.warn(`[Scheduler] ⚠️ Reminder failed for ${loan.client_name} (${normalizedRecipient}): ${sendResult.error}`);
+        console.warn(`[Scheduler] ⚠️  Reminder failed for ${client.name} (${normalizedRecipient}): ${sendResult.error}`);
       }
     }
 
     console.log(`[Scheduler] ✅ Reminder sweep completed. Checked: ${checkedCount}, Sent: ${sentCount}, Skipped: ${skippedCount}, Failed: ${failedCount}`);
-    return {
-      success: true,
-      checkedCount,
-      sentCount,
-      skippedCount,
-      failedCount,
-      timestamp: new Date().toISOString()
-    };
+    return { success: true, checkedCount, sentCount, skippedCount, failedCount, timestamp: new Date().toISOString() };
   } catch (err) {
     console.error('[Scheduler Error] Reminder sweep encountered an error:', err);
-    return {
-      success: false,
-      error: err.message,
-      checkedCount,
-      sentCount,
-      failedCount
-    };
+    return { success: false, error: err.message, checkedCount, sentCount, failedCount };
   }
 }
 
 /**
- * Initializes cron scheduler to run hourly and daily at 09:00 AM
+ * Initializes cron scheduler to run hourly
  */
 function startScheduler() {
-  // Cron schedule: Run at minute 0 of every hour (0 * * * *)
+  // Run at minute 0 of every hour
   cron.schedule('0 * * * *', async () => {
     console.log('[Scheduler] Running hourly reminder check...');
     await runReminderSweep();
@@ -153,13 +140,10 @@ function startScheduler() {
 
   console.log('⏰ [Scheduler] Automatic WhatsApp Reminder Cron initialized (runs hourly & production ready)');
 
-  // Also run an initial check 10 seconds after server startup
+  // Run an initial check 10 seconds after server startup
   setTimeout(() => {
     runReminderSweep().catch(e => console.error('[Scheduler Startup Error]', e.message));
   }, 10000);
 }
 
-module.exports = {
-  startScheduler,
-  runReminderSweep
-};
+module.exports = { startScheduler, runReminderSweep };

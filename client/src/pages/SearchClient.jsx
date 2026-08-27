@@ -64,42 +64,61 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
             Search Client
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">
-            Lookup client records by mobile number or name.
+            Lookup client records by Client ID, mobile number, name, or Aadhaar.
           </p>
         </div>
 
         {/* Search Input Bar */}
-        <form onSubmit={handleSearch} className="flex flex-col sm:flex-row gap-3 pt-1">
-          <div className="relative flex-1">
-            <Phone className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
-            <input
-              type="text"
-              required
-              autoFocus
-              placeholder="Enter 10-digit mobile number or client name..."
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              className="w-full pl-12 pr-4 py-3.5 rounded-xl bg-slate-50 dark:bg-surface-950 border border-slate-200 dark:border-surface-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 text-base font-medium shadow-inner transition-all"
-            />
+        <form onSubmit={handleSearch} className="space-y-3 pt-1">
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className="relative flex-1">
+              <Search className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
+              <input
+                type="text"
+                required
+                autoFocus
+                placeholder="Enter Client ID (e.g. 1), Name, Mobile, or Aadhaar..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                className="w-full pl-12 pr-4 py-3.5 rounded-xl bg-slate-50 dark:bg-surface-950 border border-slate-200 dark:border-surface-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 text-base font-medium shadow-inner transition-all"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="px-6 py-3.5 rounded-xl text-sm font-bold text-white bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 shadow-lg shadow-brand-600/30 active:scale-95 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
+            >
+              {loading ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <span>Searching...</span>
+                </>
+              ) : (
+                <>
+                  <Search className="w-4 h-4" />
+                  <span>Search</span>
+                </>
+              )}
+            </button>
           </div>
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="px-6 py-3.5 rounded-xl text-sm font-bold text-white bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 shadow-lg shadow-brand-600/30 active:scale-95 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
-          >
-            {loading ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                <span>Searching...</span>
-              </>
-            ) : (
-              <>
-                <Search className="w-4 h-4" />
-                <span>Search</span>
-              </>
-            )}
-          </button>
+          {/* Quick Search Badges / Hints */}
+          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+            <span className="font-semibold text-slate-600 dark:text-slate-300">Quick Search:</span>
+            <span className="px-2 py-0.5 rounded-md bg-brand-50 text-brand-700 dark:bg-brand-500/10 dark:text-brand-300 border border-brand-200 dark:border-brand-500/20 font-medium">
+              Client ID (e.g. 1, 2)
+            </span>
+            <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-surface-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-surface-700">
+              Mobile Number
+            </span>
+            <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-surface-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-surface-700">
+              Client Name
+            </span>
+            <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-surface-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-surface-700">
+              Aadhaar Number
+            </span>
+          </div>
         </form>
       </div>
 
@@ -153,7 +172,7 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                       <div className="flex items-center gap-2">
                         <h3 className="text-xl font-bold text-slate-900 dark:text-white">{client.name}</h3>
                         <span className="text-xs font-mono text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-surface-800 px-2 py-0.5 rounded border border-slate-200 dark:border-surface-700">
-                          ID #{client.id}
+                          ID #{client.displayId || client.clientNo || client.id}
                         </span>
                       </div>
                       <p className="text-xs text-slate-500 dark:text-slate-400 font-mono mt-0.5 flex items-center gap-3">
@@ -211,28 +230,15 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
 
                 {/* Active Loan Snapshot */}
                 {activeLoan && (
-                  <div className="p-4 rounded-xl bg-brand-50 dark:bg-brand-950/20 border border-brand-200 dark:border-brand-500/30 space-y-2">
+                  <div className="p-4 rounded-xl bg-brand-50/50 dark:bg-surface-950/70 border border-brand-200 dark:border-brand-500/30 space-y-3">
                     <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-brand-700 dark:text-brand-300 flex items-center gap-1.5">
-                        <Clock className="w-3.5 h-3.5" /> Active Loan
-                      </span>
-                      <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-brand-500/15 text-brand-700 dark:text-brand-300">
-                        {getDurationLabel(activeLoan.duration)}
-                      </span>
-                    </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-3 text-xs pt-1">
-                      <div>
-                        <span className="text-slate-500 dark:text-slate-400">Loan Amount: </span>
-                        <strong className="text-slate-900 dark:text-white font-mono">{formatCurrency(activeLoan.amount_taken)}</strong>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 dark:text-slate-400">Due Date: </span>
-                        <strong className="text-slate-800 dark:text-slate-200">{formatDate(activeLoan.due_date)}</strong>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 dark:text-slate-400">Remaining: </span>
-                        <strong className="text-rose-600 dark:text-rose-400 font-mono">{formatCurrency(activeLoan.remaining_amount)}</strong>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-brand-700 dark:text-brand-300 flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5" /> Active Loan Record #{activeLoan.id}
+                        </span>
+                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-brand-500/15 text-brand-700 dark:text-brand-300">
+                          {getDurationLabel(activeLoan.duration)}
+                        </span>
                       </div>
 
                       <button
@@ -243,10 +249,35 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                           remainingAmount: activeLoan.remaining_amount,
                           dueDate: activeLoan.due_date
                         }, client)}
-                        className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs"
+                        className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-sm"
                       >
-                        Record Payment
+                        + Record Payment
                       </button>
+                    </div>
+
+                    {/* 4 Financial Stat Boxes */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
+                        <span className="text-[10px] text-slate-500 uppercase font-semibold block">Principal</span>
+                        <span className="text-sm font-bold text-slate-900 dark:text-white font-mono">{formatCurrency(activeLoan.amount_taken)}</span>
+                      </div>
+                      <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
+                        <span className="text-[10px] text-slate-500 uppercase font-semibold block">Interest (10%)</span>
+                        <span className="text-sm font-bold text-amber-600 dark:text-amber-400 font-mono">+{formatCurrency(Number(activeLoan.amount_taken) * 0.10)}</span>
+                      </div>
+                      <div className="bg-purple-50/60 dark:bg-purple-950/30 p-2.5 rounded-lg border border-purple-200 dark:border-purple-500/30">
+                        <span className="text-[10px] text-purple-700 dark:text-purple-300 uppercase font-semibold block">Total Payable</span>
+                        <span className="text-sm font-bold text-purple-700 dark:text-purple-300 font-mono">{formatCurrency(Number(activeLoan.amount_taken) * 1.10)}</span>
+                      </div>
+                      <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
+                        <span className="text-[10px] text-slate-500 uppercase font-semibold block">Total Repaid</span>
+                        <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 font-mono">{formatCurrency(activeLoan.total_paid || 0)}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs text-slate-500 pt-1">
+                      <span>Due: <strong className="text-slate-800 dark:text-slate-200">{formatDate(activeLoan.due_date)}</strong></span>
+                      <span>Remaining: <strong className="text-rose-600 dark:text-rose-400 font-mono">{formatCurrency(activeLoan.remaining_amount)}</strong></span>
                     </div>
                   </div>
                 )}
@@ -259,23 +290,41 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                       <span>Previous Loans ({pastLoans.length})</span>
                     </p>
 
-                    <div className="space-y-1.5">
+                    <div className="space-y-2">
                       {pastLoans.map((pLoan, i) => (
                         <div 
                           key={pLoan.id}
-                          className="p-3 rounded-xl bg-slate-50 dark:bg-surface-950/70 border border-slate-200 dark:border-surface-800 flex items-center justify-between text-xs"
+                          className="p-3 rounded-xl bg-slate-50 dark:bg-surface-950/70 border border-slate-200 dark:border-surface-800 space-y-2 text-xs"
                         >
-                          <div className="flex items-center gap-2">
-                            <span className="text-slate-400 font-mono">#{pastLoans.length - i}</span>
-                            <span className="font-bold text-slate-800 dark:text-slate-200 font-mono">{formatCurrency(pLoan.amount_taken)}</span>
-                            <span className="text-slate-500 dark:text-slate-400">• {getDurationLabel(pLoan.duration)}</span>
-                            <span className="text-slate-400">({formatDate(pLoan.start_date)})</span>
-                          </div>
-
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className="text-slate-400 font-mono font-bold">#{pastLoans.length - i}</span>
+                              <span className="font-bold text-slate-900 dark:text-white">Record ID #{pLoan.id}</span>
+                              <span className="text-slate-500">• {getDurationLabel(pLoan.duration)}</span>
+                              <span className="text-slate-400">({formatDate(pLoan.start_date)} to {formatDate(pLoan.due_date)})</span>
+                            </div>
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30">
                               {pLoan.status}
                             </span>
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Principal</span>
+                              <span className="font-mono font-bold text-slate-800 dark:text-slate-200">{formatCurrency(pLoan.amount_taken)}</span>
+                            </div>
+                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Interest (10%)</span>
+                              <span className="font-mono font-bold text-amber-600 dark:text-amber-400">+{formatCurrency(Number(pLoan.amount_taken) * 0.10)}</span>
+                            </div>
+                            <div className="bg-purple-50/50 dark:bg-purple-950/20 p-2 rounded border border-purple-200 dark:border-purple-500/20">
+                              <span className="text-[9px] text-purple-700 dark:text-purple-300 uppercase block font-medium">Total Payable</span>
+                              <span className="font-mono font-bold text-purple-700 dark:text-purple-300">{formatCurrency(Number(pLoan.amount_taken) * 1.10)}</span>
+                            </div>
+                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Total Repaid</span>
+                              <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(pLoan.total_paid || 0)}</span>
+                            </div>
                           </div>
                         </div>
                       ))}

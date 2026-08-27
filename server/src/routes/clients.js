@@ -1,114 +1,197 @@
 const express = require('express');
 const router = express.Router();
-const { getPool, calculateDueDate, getDurationDays, evaluateStatus, maskAadhaar, updateAllRecordStatuses, syncLoanBalances, syncAllLoanBalances } = require('../db');
+const mongoose = require('mongoose');
+const {
+  calculateDueDate, getDurationDays, evaluateStatus,
+  maskAadhaar, syncLoanBalances, syncAllLoanBalances, updateAllRecordStatuses, getTodayStr
+} = require('../db');
 const authMiddleware = require('../middleware/auth');
+const Client = require('../models/Client');
+const Loan = require('../models/Loan');
+const Transaction = require('../models/Transaction');
+const Reminder = require('../models/Reminder');
 
-// GET /api/clients - List clients with filters (duration, status, search)
+// ─── Helper: format loan for response ────────────────────────────────────────
+function fmtLoan(loan, todayStr) {
+  const principal = Number(loan.amountTaken) || 0;
+  const rate = Number(loan.interestRate) || 10.00;
+  const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
+  const dueDate = loan.dueDate || '';
+
+  let daysOverdue = 0;
+  let overdueWeeks = 0;
+  if (dueDate && todayStr > dueDate && Number(loan.remainingAmount) > 0) {
+    const d1 = new Date(dueDate + 'T00:00:00');
+    const d2 = new Date(todayStr + 'T00:00:00');
+    daysOverdue = Math.max(0, Math.floor((d2 - d1) / (1000 * 60 * 60 * 24)));
+    overdueWeeks = Math.ceil(daysOverdue / 7);
+  }
+  const overdueInterest = overdueWeeks * baseInterest;
+
+  return {
+    id: loan._id.toString(),
+    clientId: loan.clientId?.toString(),
+    amountTaken: principal,
+    interestRate: rate,
+    baseInterest,
+    daysOverdue,
+    overdueWeeks,
+    overdueInterest,
+    interestAmount: Number(loan.interestAmount) || baseInterest,
+    totalPayable: Number(loan.totalPayable) || (principal + baseInterest),
+    duration: loan.duration,
+    durationDays: loan.durationDays,
+    startDate: loan.startDate,
+    dueDate,
+    totalPaid: Number(loan.totalPaid) || 0,
+    remainingAmount: Number(loan.remainingAmount) || 0,
+    status: loan.status,
+    note: loan.note,
+    createdAt: loan.createdAt,
+    updatedAt: loan.updatedAt
+  };
+}
+
+// ─── GET /api/clients ─────────────────────────────────────────────────────────
 router.get('/', authMiddleware, async (req, res) => {
   try {
-    const db = await getPool();
     await updateAllRecordStatuses();
 
     const { duration, status, search, startDate, endDate, limit = 200, offset = 0 } = req.query;
+    const todayStr = getTodayStr();
 
-    let query = `
-      SELECT 
-        c.id,
-        c.name,
-        c.mobile_number as mobileNumber,
-        c.aadhaar_number as aadhaarNumber,
-        c.address,
-        c.notes,
-        DATE_FORMAT(c.created_at, '%Y-%m-%d') as createdAt,
-        l.id as latestRecordId,
-        l.amount_taken as amountTaken,
-        l.duration,
-        l.duration_days as durationDays,
-        DATE_FORMAT(l.start_date, '%Y-%m-%d') as startDate,
-        DATE_FORMAT(l.due_date, '%Y-%m-%d') as dueDate,
-        l.total_paid as totalPaid,
-        l.remaining_amount as remainingAmount,
-        l.status as loanStatus,
-        (SELECT COUNT(*) FROM loan_records WHERE client_id = c.id) as totalLoansCount,
-        (SELECT COALESCE(SUM(amount_taken), 0) FROM loan_records WHERE client_id = c.id) as totalAmountTaken,
-        (SELECT COALESCE(SUM(total_paid), 0) FROM loan_records WHERE client_id = c.id) as totalAmountPaid,
-        (SELECT COALESCE(SUM(remaining_amount), 0) FROM loan_records WHERE client_id = c.id) as totalOutstandingAmount
-      FROM clients c
-      LEFT JOIN (
-        SELECT lr.*
-        FROM loan_records lr
-        INNER JOIN (
-          SELECT client_id, MAX(id) AS max_id
-          FROM loan_records
-          GROUP BY client_id
-        ) latest ON lr.id = latest.max_id
-      ) l ON l.client_id = c.id
-      WHERE 1=1
-    `;
+    const isDirectoryMode = !duration || ['directory', 'all'].includes(duration.toLowerCase());
 
-    const params = [];
+    // Build client base filter (search, date range)
+    const clientFilter = {};
 
-    if ((duration && ['due-tomorrow', 'due_tomorrow'].includes(duration.toLowerCase())) || (status && ['due-tomorrow', 'due_tomorrow'].includes(status.toLowerCase()))) {
-      const tomorrowObj = new Date();
-      tomorrowObj.setDate(tomorrowObj.getDate() + 1);
-      const tomorrowStr = tomorrowObj.toISOString().split('T')[0];
-      query += ` AND DATE_FORMAT(l.due_date, '%Y-%m-%d') = ? AND l.remaining_amount > 0 AND l.status != 'completed'`;
-      params.push(tomorrowStr);
-    } else if (duration && ['completed', 'paid'].includes(duration.toLowerCase()) || status === 'completed') {
-      query += ` AND (l.remaining_amount = 0 OR l.status = 'completed') AND l.id IS NOT NULL`;
-    } else if (duration && ['weekly', 'fortnight', 'monthly'].includes(duration.toLowerCase())) {
-      query += ` AND l.duration = ? AND l.remaining_amount > 0 AND l.status != 'completed'`;
-      params.push(duration.toLowerCase());
-    } else if (duration && ['history', 'all-history'].includes(duration.toLowerCase())) {
-      // History shows all clients with loan records
-      if (status && status.toLowerCase() === 'active') {
-        query += ` AND l.remaining_amount > 0 AND l.status != 'completed'`;
-      } else if (status && status.toLowerCase() === 'overdue') {
-        query += ` AND l.status = 'overdue' AND l.remaining_amount > 0`;
-      } else if (status && status.toLowerCase() === 'completed') {
-        query += ` AND (l.remaining_amount = 0 OR l.status = 'completed')`;
-      }
-    } else if (duration && ['directory', 'all-clients', 'all'].includes(duration.toLowerCase())) {
-      // Pure directory: show all clients without restricting to loan status
-      if (status && status.toLowerCase() === 'active') {
-        query += ` AND l.remaining_amount > 0 AND l.status != 'completed'`;
-      } else if (status && status.toLowerCase() === 'overdue') {
-        query += ` AND l.status = 'overdue' AND l.remaining_amount > 0`;
-      } else if (status && status.toLowerCase() === 'completed') {
-        query += ` AND (l.remaining_amount = 0 OR l.status = 'completed')`;
-      }
-    }
-
-    if (startDate && startDate.trim()) {
-      query += ` AND (DATE(c.created_at) >= ? OR DATE(l.start_date) >= ?)`;
-      params.push(startDate.trim(), startDate.trim());
-    }
-
-    if (endDate && endDate.trim()) {
-      query += ` AND (DATE(c.created_at) <= ? OR DATE(l.start_date) <= ?)`;
-      params.push(endDate.trim(), endDate.trim());
-    }
+    if (startDate) clientFilter.createdAt = { ...clientFilter.createdAt, $gte: new Date(startDate) };
+    if (endDate) clientFilter.createdAt = { ...clientFilter.createdAt, $lte: new Date(endDate + 'T23:59:59') };
 
     if (search && search.trim()) {
-      const term = `%${search.trim()}%`;
-      query += ` AND (c.name LIKE ? OR c.mobile_number LIKE ? OR c.aadhaar_number LIKE ?)`;
-      params.push(term, term, term);
+      const raw = search.trim();
+      const cleanDigits = raw.replace(/\D/g, '');
+      const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(raw);
+      const cleanIdCandidate = raw.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
+      const isPureDigits = /^\d+$/.test(cleanIdCandidate);
+      const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
+
+      if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
+        clientFilter.$or = [{ clientNo: parsedId }];
+      } else if (cleanDigits.length >= 7) {
+        clientFilter.mobileNumber = { $regex: cleanDigits, $options: 'i' };
+      } else {
+        clientFilter.$or = [
+          { name: { $regex: raw, $options: 'i' } },
+          { mobileNumber: { $regex: cleanDigits || raw, $options: 'i' } },
+          { aadhaarNumber: { $regex: cleanDigits || raw, $options: 'i' } }
+        ];
+      }
     }
 
-    query += ` ORDER BY 
-      CASE WHEN l.status = 'overdue' THEN 1 WHEN l.status = 'active' THEN 2 ELSE 3 END ASC,
-      l.due_date ASC,
-      c.created_at DESC
-      LIMIT ? OFFSET ?`;
-    params.push(Number(limit), Number(offset));
+    // If specific duration filter (weekly, fortnight, monthly, due-tomorrow, overdue, completed)
+    if (!isDirectoryMode) {
+      const loanFilter = { remainingAmount: { $gte: 0 } };
 
-    const [clients] = await db.query(query, params);
+      if (['due-tomorrow', 'due_tomorrow'].includes(duration.toLowerCase())) {
+        const tomorrow = new Date(todayStr + 'T00:00:00');
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const y = tomorrow.getFullYear();
+        const m = String(tomorrow.getMonth() + 1).padStart(2, '0');
+        const d = String(tomorrow.getDate()).padStart(2, '0');
+        const tomorrowStr = `${y}-${m}-${d}`;
+        loanFilter.dueDate = tomorrowStr;
+        loanFilter.remainingAmount = { $gt: 0 };
+        loanFilter.status = { $ne: 'completed' };
+      } else if (['overdue'].includes(duration.toLowerCase())) {
+        loanFilter.$or = [{ status: 'overdue' }, { dueDate: { $lt: todayStr } }];
+        loanFilter.remainingAmount = { $gt: 0 };
+        loanFilter.status = { $ne: 'completed' };
+      } else if (['completed', 'paid', 'history'].includes(duration.toLowerCase())) {
+        loanFilter.$or = [{ remainingAmount: 0 }, { status: 'completed' }];
+      } else if (['weekly', 'fortnight', 'monthly'].includes(duration.toLowerCase())) {
+        loanFilter.duration = duration.toLowerCase();
+        loanFilter.remainingAmount = { $gt: 0 };
+        loanFilter.status = { $ne: 'completed' };
+      }
 
-    const formatted = clients.map(client => ({
-      ...client,
-      maskedAadhaar: maskAadhaar(client.aadhaarNumber),
-      status: client.loanStatus || 'no_loan'
-    }));
+      const matchingLoans = await Loan.find(loanFilter, 'clientId').lean();
+      const clientIds = [...new Set(matchingLoans.map(l => l.clientId.toString()))];
+      clientFilter._id = { $in: clientIds.map(id => new mongoose.Types.ObjectId(id)) };
+    }
+
+    const clients = await Client.find(clientFilter)
+      .sort({ clientNo: 1 })
+      .skip(Number(offset))
+      .limit(Number(limit))
+      .lean();
+
+    // Enrich each client with their loan stats
+    const formatted = [];
+    for (const client of clients) {
+      const loans = await Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean();
+
+      const activeLoans = loans.filter(l => (l.status === 'active' || l.status === 'overdue') && Number(l.remainingAmount) > 0);
+      const primaryLoan = activeLoans[0] || loans[0] || {};
+
+      // Filter by status if specified in query ('active' or 'completed')
+      if (status === 'active' && activeLoans.length === 0) continue;
+      if (status === 'completed' && (loans.length === 0 || activeLoans.length > 0)) continue;
+
+      const principal = Number(primaryLoan.amountTaken) || 0;
+      const rate = Number(primaryLoan.interestRate) || 10;
+      const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
+      const dueDate = primaryLoan.dueDate || '';
+
+      let daysOverdue = 0;
+      let overdueWeeks = 0;
+      if (dueDate && todayStr > dueDate && Number(primaryLoan.remainingAmount) > 0) {
+        const d1 = new Date(dueDate + 'T00:00:00');
+        const d2 = new Date(todayStr + 'T00:00:00');
+        daysOverdue = Math.max(0, Math.floor((d2 - d1) / (1000 * 60 * 60 * 24)));
+        overdueWeeks = Math.ceil(daysOverdue / 7);
+      }
+
+      const totalGiven = loans.reduce((s, l) => s + Number(l.amountTaken || 0), 0);
+      const totalPaid = loans.reduce((s, l) => s + Number(l.totalPaid || 0), 0);
+      const totalOutstanding = loans.reduce((s, l) => s + Number(l.remainingAmount || 0), 0);
+
+      formatted.push({
+        id: client._id.toString(),
+        clientNo: client.clientNo || client._id.toString(),
+        displayId: client.clientNo || client._id.toString(),
+        name: client.name,
+        mobileNumber: client.mobileNumber,
+        aadhaarNumber: client.aadhaarNumber,
+        maskedAadhaar: maskAadhaar(client.aadhaarNumber),
+        address: client.address,
+        notes: client.notes,
+        createdAt: client.createdAt,
+        totalLoansCount: loans.length,
+        totalAmountTaken: totalGiven,
+        totalPaid: totalPaid,
+        totalAmountPaid: totalPaid,
+        totalOutstanding: totalOutstanding,
+        totalOutstandingAmount: totalOutstanding,
+        latestRecordId: primaryLoan._id ? primaryLoan._id.toString() : null,
+        amountTaken: principal,
+        interestRate: rate,
+        interestAmount: Number(primaryLoan.interestAmount) || 0,
+        totalPayable: Number(primaryLoan.totalPayable) || 0,
+        duration: primaryLoan.duration,
+        durationDays: primaryLoan.durationDays,
+        startDate: primaryLoan.startDate,
+        dueDate,
+        loanTotalPaid: Number(primaryLoan.totalPaid) || 0,
+        remainingAmount: Number(primaryLoan.remainingAmount) || 0,
+        loanStatus: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
+        status: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
+        baseInterest,
+        daysOverdue,
+        overdueWeeks,
+        overdueInterest: overdueWeeks * baseInterest
+      });
+    }
 
     return res.json({ clients: formatted, count: formatted.length });
   } catch (err) {
@@ -117,68 +200,68 @@ router.get('/', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/clients/search/:query - Search by mobile or keyword
+// ─── GET /api/clients/search/:query ──────────────────────────────────────────
 router.get('/search/:query', authMiddleware, async (req, res) => {
   try {
-    const db = await getPool();
     await updateAllRecordStatuses();
-
     const rawQuery = req.params.query.trim();
     const cleanDigits = rawQuery.replace(/\D/g, '');
+    const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(rawQuery);
+    const cleanIdCandidate = rawQuery.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
+    const isPureDigits = /^\d+$/.test(cleanIdCandidate);
+    const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
 
-    let clients;
-    if (cleanDigits.length >= 3) {
-      [clients] = await db.query(`
-        SELECT c.*, 
-          (SELECT COUNT(*) FROM loan_records WHERE client_id = c.id) as totalLoansCount,
-          (SELECT COALESCE(SUM(amount_taken), 0) FROM loan_records WHERE client_id = c.id) as totalAmountTaken,
-          (SELECT COALESCE(SUM(total_paid), 0) FROM loan_records WHERE client_id = c.id) as totalPaid,
-          (SELECT COALESCE(SUM(remaining_amount), 0) FROM loan_records WHERE client_id = c.id) as totalOutstanding
-        FROM clients c
-        WHERE c.mobile_number LIKE ? OR c.name LIKE ?
-        ORDER BY c.created_at DESC
-        LIMIT 10
-      `, [`%${cleanDigits}%`, `%${rawQuery}%`]);
+    let clientFilter = {};
+    if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
+      clientFilter = { clientNo: parsedId };
+    } else if (cleanDigits.length >= 7) {
+      clientFilter = { $or: [{ mobileNumber: { $regex: cleanDigits, $options: 'i' } }, { aadhaarNumber: { $regex: cleanDigits, $options: 'i' } }] };
     } else {
-      [clients] = await db.query(`
-        SELECT c.*, 
-          (SELECT COUNT(*) FROM loan_records WHERE client_id = c.id) as totalLoansCount,
-          (SELECT COALESCE(SUM(amount_taken), 0) FROM loan_records WHERE client_id = c.id) as totalAmountTaken,
-          (SELECT COALESCE(SUM(total_paid), 0) FROM loan_records WHERE client_id = c.id) as totalPaid,
-          (SELECT COALESCE(SUM(remaining_amount), 0) FROM loan_records WHERE client_id = c.id) as totalOutstanding
-        FROM clients c
-        WHERE c.name LIKE ?
-        ORDER BY c.created_at DESC
-        LIMIT 10
-      `, [`%${rawQuery}%`]);
+      clientFilter = { $or: [
+        { name: { $regex: rawQuery, $options: 'i' } },
+        { mobileNumber: { $regex: cleanDigits || rawQuery, $options: 'i' } },
+        { aadhaarNumber: { $regex: cleanDigits || rawQuery, $options: 'i' } }
+      ]};
     }
+
+    const clients = await Client.find(clientFilter).limit(25).lean();
 
     const results = [];
     for (const c of clients) {
-      const [records] = await db.query(`
-        SELECT 
-          id, client_id, amount_taken, duration, duration_days,
-          DATE_FORMAT(start_date, '%Y-%m-%d') as start_date,
-          DATE_FORMAT(due_date, '%Y-%m-%d') as due_date,
-          total_paid, remaining_amount, status, note, created_at, updated_at
-        FROM loan_records 
-        WHERE client_id = ? 
-        ORDER BY created_at DESC
-      `, [c.id]);
+      const loans = await Loan.find({ clientId: c._id }).sort({ createdAt: -1 }).lean();
+      const totalLoansCount = loans.length;
+      const totalAmountTaken = loans.reduce((s, l) => s + (Number(l.amountTaken) || 0), 0);
+      const totalPaid = loans.reduce((s, l) => s + (Number(l.totalPaid) || 0), 0);
+      const totalOutstanding = loans.reduce((s, l) => s + (Number(l.remainingAmount) || 0), 0);
 
       results.push({
-        id: c.id,
+        id: c._id.toString(),
+        clientNo: c.clientNo,
+        displayId: c.clientNo,
         name: c.name,
-        mobileNumber: c.mobile_number,
-        aadhaarNumber: c.aadhaar_number,
-        maskedAadhaar: maskAadhaar(c.aadhaar_number),
+        mobileNumber: c.mobileNumber,
+        aadhaarNumber: c.aadhaarNumber,
+        maskedAadhaar: maskAadhaar(c.aadhaarNumber),
         address: c.address,
         notes: c.notes,
-        totalLoansCount: c.totalLoansCount,
-        totalAmountTaken: c.totalAmountTaken,
-        totalPaid: c.totalPaid,
-        totalOutstanding: c.totalOutstanding,
-        records
+        totalLoansCount,
+        totalAmountTaken,
+        totalPaid,
+        totalOutstanding,
+        records: loans.map(l => ({
+          id: l._id.toString(),
+          clientId: l.clientId.toString(),
+          amountTaken: l.amountTaken,
+          duration: l.duration,
+          durationDays: l.durationDays,
+          start_date: l.startDate,
+          due_date: l.dueDate,
+          totalPaid: l.totalPaid,
+          remainingAmount: l.remainingAmount,
+          status: l.status,
+          note: l.note,
+          createdAt: l.createdAt
+        }))
       });
     }
 
@@ -189,107 +272,60 @@ router.get('/search/:query', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/clients/:id - Full details with all loan records & transaction history
+// ─── GET /api/clients/:id ─────────────────────────────────────────────────────
 router.get('/:id', authMiddleware, async (req, res) => {
   try {
-    const db = await getPool();
     await updateAllRecordStatuses();
-
+    const todayStr = getTodayStr();
     const clientId = req.params.id;
-    const [clientRows] = await db.query('SELECT * FROM clients WHERE id = ?', [clientId]);
-    const client = clientRows[0];
 
-    if (!client) {
-      return res.status(404).json({ error: 'Client not found.' });
+    let client;
+    if (mongoose.Types.ObjectId.isValid(clientId)) {
+      client = await Client.findById(clientId).lean();
     }
+    if (!client) {
+      const parsed = parseInt(clientId, 10);
+      if (!isNaN(parsed)) client = await Client.findOne({ clientNo: parsed }).lean();
+    }
+    if (!client) return res.status(404).json({ error: 'Client not found.' });
 
-    const [loans] = await db.query(`
-      SELECT 
-        id, client_id, amount_taken, interest_rate, interest_amount, total_payable, duration, duration_days,
-        DATE_FORMAT(start_date, '%Y-%m-%d') as start_date,
-        DATE_FORMAT(due_date, '%Y-%m-%d') as due_date,
-        total_paid, remaining_amount, status, note, created_at, updated_at
-      FROM loan_records 
-      WHERE client_id = ? 
-      ORDER BY created_at DESC
-    `, [clientId]);
+    const loans = await Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean();
 
+    let lifetimeGiven = 0, lifetimeInterest = 0, lifetimeTotalPayable = 0, lifetimePaid = 0, lifetimeRemaining = 0;
     const loansWithTransactions = [];
-    let lifetimeGiven = 0;
-    let lifetimeInterest = 0;
-    let lifetimeTotalPayable = 0;
-    let lifetimePaid = 0;
-    let lifetimeRemaining = 0;
-    let activeLoan = null;
 
     for (const loan of loans) {
-      const [transactions] = await db.query(`
-        SELECT 
-          id, record_id, client_id, amount, transaction_type,
-          DATE_FORMAT(transaction_date, '%Y-%m-%d') as transaction_date,
-          remaining_after, payment_mode, note, created_at
-        FROM transactions 
-        WHERE record_id = ? 
-        ORDER BY transaction_date ASC, id ASC
-      `, [loan.id]);
-
-      const [reminderLogs] = await db.query(`
-        SELECT 
-          id, loan_id, client_id, phone_number, reminder_type,
-          DATE_FORMAT(due_date, '%Y-%m-%d') as due_date,
-          amount, message, status, sent_at, whatsapp_message_id, error_message
-        FROM reminder_logs
-        WHERE loan_id = ?
-        ORDER BY sent_at DESC
-      `, [loan.id]);
-
-      const principal = Number(loan.amount_taken) || 0;
-      const rate = Number(loan.interest_rate) || 10.00;
-      const interest = Number(loan.interest_amount) > 0 ? Number(loan.interest_amount) : Math.round(principal * (rate / 100) * 100) / 100;
-      const payable = Number(loan.total_payable) > 0 ? Number(loan.total_payable) : (principal + interest);
+      const transactions = await Transaction.find({ loanId: loan._id }).sort({ transactionDate: 1, _id: 1 }).lean();
+      const reminders = await Reminder.find({ loanId: loan._id }).sort({ sentAt: -1 }).lean();
 
       const loanObj = {
-        id: loan.id,
-        clientId: loan.client_id,
-        amountTaken: principal,
-        interestRate: rate,
-        interestAmount: interest,
-        totalPayable: payable,
-        duration: loan.duration,
-        durationDays: loan.duration_days,
-        startDate: loan.start_date,
-        dueDate: loan.due_date,
-        totalPaid: Number(loan.total_paid) || 0,
-        remainingAmount: Number(loan.remaining_amount) || 0,
-        status: loan.status,
-        note: loan.note,
-        createdAt: loan.created_at,
-        updatedAt: loan.updated_at,
+        ...fmtLoan(loan, todayStr),
         transactions: transactions.map(t => ({
-          id: t.id,
-          recordId: t.record_id,
-          clientId: t.client_id,
+          id: t._id.toString(),
+          recordId: t.loanId.toString(),
+          clientId: t.clientId.toString(),
           amount: Number(t.amount),
-          transactionType: t.transaction_type,
-          transactionDate: t.transaction_date,
-          remainingAfter: Number(t.remaining_after),
-          paymentMode: t.payment_mode,
+          transactionType: t.transactionType,
+          transactionDate: t.transactionDate,
+          remainingAfter: Number(t.remainingAfter),
+          paymentMode: t.paymentMode,
           note: t.note,
-          createdAt: t.created_at
+          createdAt: t.createdAt
         })),
-        reminders: reminderLogs.map(r => ({
-          id: r.id,
-          loanId: r.loan_id,
-          clientId: r.client_id,
-          phoneNumber: r.phone_number,
-          reminderType: r.reminder_type,
-          dueDate: r.due_date,
+        reminders: reminders.map(r => ({
+          id: r._id.toString(),
+          loanId: r.loanId.toString(),
+          clientId: r.clientId.toString(),
+          phoneNumber: r.phoneNumber,
+          reminderType: r.reminderType,
+          channel: r.channel,
+          dueDate: r.dueDate,
           amount: Number(r.amount),
           message: r.message,
           status: r.status,
-          sentAt: r.sent_at,
-          whatsappMessageId: r.whatsapp_message_id,
-          errorMessage: r.error_message
+          sentAt: r.sentAt,
+          whatsappMessageId: r.whatsappMessageId,
+          errorMessage: r.errorMessage
         }))
       };
 
@@ -298,62 +334,48 @@ router.get('/:id', authMiddleware, async (req, res) => {
       lifetimeTotalPayable += loanObj.totalPayable;
       lifetimePaid += loanObj.totalPaid;
       lifetimeRemaining += loanObj.remainingAmount;
-
-      if ((loanObj.status === 'active' || loanObj.status === 'overdue') && !activeLoan) {
-        activeLoan = loanObj;
-      }
-
       loansWithTransactions.push(loanObj);
     }
 
-    // Also fetch all client reminder logs across all loans
-    const [allClientReminders] = await db.query(`
-      SELECT 
-        id, loan_id, client_id, phone_number, reminder_type,
-        DATE_FORMAT(due_date, '%Y-%m-%d') as due_date,
-        amount, message, status, sent_at, whatsapp_message_id, error_message
-      FROM reminder_logs
-      WHERE client_id = ?
-      ORDER BY sent_at DESC
-      LIMIT 20
-    `, [clientId]);
+    const activeLoans = loansWithTransactions.filter(l => (l.status === 'active' || l.status === 'overdue') && l.remainingAmount > 0);
+    const previousLoans = loansWithTransactions.filter(l => !activeLoans.find(al => al.id === l.id));
+
+    const allReminders = await Reminder.find({ clientId: client._id }).sort({ sentAt: -1 }).limit(50).lean();
 
     return res.json({
       client: {
-        id: client.id,
+        id: client._id.toString(),
+        clientNo: client.clientNo,
+        displayId: client.clientNo,
         name: client.name,
-        mobileNumber: client.mobile_number,
-        aadhaarNumber: client.aadhaar_number,
-        maskedAadhaar: maskAadhaar(client.aadhaar_number),
+        mobileNumber: client.mobileNumber,
+        aadhaarNumber: client.aadhaarNumber,
+        maskedAadhaar: maskAadhaar(client.aadhaarNumber),
         address: client.address,
         notes: client.notes,
-        createdAt: client.created_at,
-        updatedAt: client.updated_at
+        createdAt: client.createdAt,
+        updatedAt: client.updatedAt
       },
-      activeLoan: activeLoan || (loansWithTransactions.length > 0 ? loansWithTransactions[0] : null),
+      activeLoan: activeLoans[0] || (loansWithTransactions.length > 0 ? loansWithTransactions[0] : null),
+      activeLoans,
+      previousLoans,
       loanRecords: loansWithTransactions,
-      reminders: allClientReminders.map(r => ({
-        id: r.id,
-        loanId: r.loan_id,
-        clientId: r.client_id,
-        phoneNumber: r.phone_number,
-        reminderType: r.reminder_type,
-        dueDate: r.due_date,
+      reminders: allReminders.map(r => ({
+        id: r._id.toString(),
+        loanId: r.loanId.toString(),
+        clientId: r.clientId.toString(),
+        phoneNumber: r.phoneNumber,
+        reminderType: r.reminderType,
+        channel: r.channel || 'whatsapp',
+        dueDate: r.dueDate,
         amount: Number(r.amount),
         message: r.message,
         status: r.status,
-        sentAt: r.sent_at,
-        whatsappMessageId: r.whatsapp_message_id,
-        errorMessage: r.error_message
+        sentAt: r.sentAt,
+        whatsappMessageId: r.whatsappMessageId,
+        errorMessage: r.errorMessage
       })),
-      stats: {
-        totalLoans: loansWithTransactions.length,
-        lifetimeGiven,
-        lifetimeInterest,
-        lifetimeTotalPayable,
-        lifetimePaid,
-        lifetimeRemaining
-      }
+      stats: { totalLoans: loansWithTransactions.length, lifetimeGiven, lifetimeInterest, lifetimeTotalPayable, lifetimePaid, lifetimeRemaining }
     });
   } catch (err) {
     console.error('Client detail error:', err);
@@ -361,148 +383,139 @@ router.get('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// POST /api/clients - Add New Client with Initial Loan Record & Disbursement
+// ─── GET /api/clients/:id/export-csv ─────────────────────────────────────────
+router.get('/:id/export-csv', authMiddleware, async (req, res) => {
+  try {
+    const clientId = req.params.id;
+    let client;
+    if (mongoose.Types.ObjectId.isValid(clientId)) client = await Client.findById(clientId).lean();
+    if (!client) { const p = parseInt(clientId, 10); if (!isNaN(p)) client = await Client.findOne({ clientNo: p }).lean(); }
+    if (!client) return res.status(404).json({ error: 'Client not found.' });
+
+    const loans = await Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean();
+    const esc = (v) => { if (v == null) return '""'; return `"${String(v).replace(/"/g, '""')}"`; };
+
+    const headers = ['Client ID','Client Name','Mobile Number','Aadhaar Number','Address','Loan ID','Loan Duration','Loan Start Date','Loan Due Date','Loan Principal (INR)','Loan Interest Rate (%)','Loan Interest (INR)','Loan Total Payable (INR)','Loan Current Status','Transaction ID','Transaction Date','Transaction Type','Transaction Amount (INR)','Payment Mode','Remaining Balance After (INR)','Transaction Note'];
+    const rows = [];
+
+    if (loans.length === 0) {
+      rows.push([esc(client.clientNo), esc(client.name), esc(client.mobileNumber), esc(client.aadhaarNumber || 'N/A'), esc(client.address || ''), '""','""','""','""','""','""','""','""','""','""','""','""','""','""','""', esc('No loan records found')]);
+    } else {
+      for (const loan of loans) {
+        const transactions = await Transaction.find({ loanId: loan._id }).sort({ transactionDate: 1 }).lean();
+        const principal = Number(loan.amountTaken || 0);
+        const rate = Number(loan.interestRate || 10);
+        const interest = Number(loan.interestAmount || (principal * rate / 100));
+        const payable = Number(loan.totalPayable || (principal + interest));
+
+        if (transactions.length === 0) {
+          rows.push([esc(client.clientNo), esc(client.name), esc(client.mobileNumber), esc(client.aadhaarNumber || 'N/A'), esc(client.address || ''), esc(`#${loan._id}`), esc(loan.duration), esc(loan.startDate), esc(loan.dueDate), esc(principal), esc(`${rate}%`), esc(interest), esc(payable), esc((loan.status || '').toUpperCase()), '""', '""', '""', '""', '""', '""', '""']);
+        } else {
+          for (const t of transactions) {
+            rows.push([esc(client.clientNo), esc(client.name), esc(client.mobileNumber), esc(client.aadhaarNumber || 'N/A'), esc(client.address || ''), esc(`#${loan._id}`), esc(loan.duration), esc(loan.startDate), esc(loan.dueDate), esc(principal), esc(`${rate}%`), esc(interest), esc(payable), esc((loan.status || '').toUpperCase()), esc(`#${t._id}`), esc(t.transactionDate), esc((t.transactionType || '').toUpperCase()), esc(t.amount), esc(t.paymentMode || 'Cash'), esc(t.remainingAfter), esc(t.note || '')]);
+          }
+        }
+      }
+    }
+
+    const csv = '\uFEFF' + [headers.map(h => `"${h}"`).join(','), ...rows.map(r => r.join(','))].join('\r\n');
+    const safeClientName = client.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const filename = `Client_${client.clientNo}_${safeClientName}_Transactions_${getTodayStr()}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(csv);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to export transactions CSV: ' + err.message });
+  }
+});
+
+// ─── POST /api/clients ────────────────────────────────────────────────────────
 router.post('/', authMiddleware, async (req, res) => {
   const {
-    name,
-    mobileNumber,
-    aadhaarNumber,
-    address,
-    notes,
-    amountTaken,
-    duration,
-    startDate = new Date().toISOString().split('T')[0],
-    paymentMode = 'Cash'
+    name, mobileNumber, aadhaarNumber, address, notes,
+    amountTaken, duration, startDate = getTodayStr(), paymentMode = 'Cash'
   } = req.body;
 
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'Client name is required.' });
-  }
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Client name is required.' });
 
   const cleanMobile = (mobileNumber || '').replace(/\D/g, '');
-  if (!cleanMobile || cleanMobile.length < 10) {
-    return res.status(400).json({ error: 'Valid 10-digit mobile number is required.' });
-  }
+  if (!cleanMobile || cleanMobile.length < 10) return res.status(400).json({ error: 'Valid 10-digit mobile number is required.' });
 
   const parsedAmount = parseFloat(amountTaken);
-  if (isNaN(parsedAmount) || parsedAmount <= 0) {
-    return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
-  }
+  if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
 
   if (!duration || !['weekly', 'fortnight', 'monthly'].includes(duration.toLowerCase())) {
     return res.status(400).json({ error: 'Valid duration is required (weekly, fortnight, monthly).' });
   }
 
   const cleanAadhaar = aadhaarNumber ? aadhaarNumber.replace(/\D/g, '') : null;
-  if (cleanAadhaar && cleanAadhaar.length !== 12) {
-    return res.status(400).json({ error: 'Aadhaar number must be exactly 12 digits.' });
-  }
-
-  const selectedDuration = duration.toLowerCase();
-  const dueDate = calculateDueDate(startDate, selectedDuration);
-  const durationDays = getDurationDays(selectedDuration);
-
-  // 10% One-time Loan Interest Calculation
-  const interestRate = 10.00;
-  const interestAmount = Math.round(parsedAmount * (interestRate / 100) * 100) / 100;
-  const totalPayable = parsedAmount + interestAmount;
-  const initialStatus = evaluateStatus(totalPayable, dueDate);
+  if (cleanAadhaar && cleanAadhaar.length !== 12) return res.status(400).json({ error: 'Aadhaar number must be exactly 12 digits.' });
 
   try {
-    const db = await getPool();
-    const [existing] = await db.query('SELECT id FROM clients WHERE mobile_number = ?', [cleanMobile]);
-    if (existing.length > 0) {
-      return res.status(400).json({ 
+    const existing = await Client.findOne({ mobileNumber: cleanMobile });
+    if (existing) {
+      return res.status(400).json({
         error: `A client with mobile number ${cleanMobile} already exists. Use "Add New Loan" to create a new financial record for this client.`,
-        existingClientId: existing[0].id
+        existingClientId: existing._id.toString()
       });
     }
 
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
+    const selectedDuration = duration.toLowerCase();
+    const dueDate = calculateDueDate(startDate, selectedDuration);
+    const durationDays = getDurationDays(selectedDuration);
+    const interestRate = 10.00;
+    const interestAmount = Math.round(parsedAmount * (interestRate / 100) * 100) / 100;
+    const totalPayable = parsedAmount + interestAmount;
+    const initialStatus = evaluateStatus(totalPayable, dueDate);
 
-      const [clientRes] = await connection.query(`
-        INSERT INTO clients (name, mobile_number, aadhaar_number, address, notes)
-        VALUES (?, ?, ?, ?, ?)
-      `, [name.trim(), cleanMobile, cleanAadhaar, address || '', notes || '']);
-      const clientId = clientRes.insertId;
+    const client = await Client.create({
+      name: name.trim(), mobileNumber: cleanMobile,
+      aadhaarNumber: cleanAadhaar, address: address || '', notes: notes || ''
+    });
 
-      const [loanRes] = await connection.query(`
-        INSERT INTO loan_records (
-          client_id, amount_taken, interest_rate, interest_amount, total_payable,
-          duration, duration_days, start_date, due_date, total_paid, remaining_amount, status, note
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-      `, [
-        clientId,
-        parsedAmount,
-        interestRate,
-        interestAmount,
-        totalPayable,
-        selectedDuration,
-        durationDays,
-        startDate,
-        dueDate,
-        totalPayable,
-        initialStatus,
-        'Initial loan record'
-      ]);
-      const recordId = loanRes.insertId;
+    const loan = await Loan.create({
+      clientId: client._id,
+      amountTaken: parsedAmount, interestRate, interestAmount, totalPayable,
+      duration: selectedDuration, durationDays, startDate, dueDate,
+      totalPaid: 0, remainingAmount: totalPayable, status: initialStatus,
+      note: 'Initial loan record'
+    });
 
-      await connection.query(`
-        INSERT INTO transactions (record_id, client_id, amount, transaction_type, transaction_date, remaining_after, payment_mode, note)
-        VALUES (?, ?, ?, 'disbursement', ?, ?, ?, ?)
-      `, [recordId, clientId, parsedAmount, startDate, totalPayable, paymentMode, 'Initial loan disbursement']);
+    await Transaction.create({
+      loanId: loan._id, clientId: client._id,
+      amount: parsedAmount, transactionType: 'disbursement',
+      transactionDate: startDate, remainingAfter: totalPayable,
+      paymentMode, note: 'Initial loan disbursement'
+    });
 
-      await connection.commit();
-
-      return res.status(201).json({
-        message: 'Client created successfully with initial loan record and 10% interest applied',
-        clientId,
-        recordId,
-        principalAmount: parsedAmount,
-        interestRate,
-        interestAmount,
-        totalPayable,
-        dueDate,
-        duration: selectedDuration
-      });
-    } catch (err) {
-      await connection.rollback();
-      throw err;
-    } finally {
-      connection.release();
-    }
+    return res.status(201).json({
+      message: 'Client created successfully with initial loan record and 10% interest applied',
+      clientId: client._id.toString(),
+      clientNo: client.clientNo,
+      displayId: client.clientNo,
+      recordId: loan._id.toString(),
+      principalAmount: parsedAmount, interestRate, interestAmount, totalPayable, dueDate,
+      duration: selectedDuration
+    });
   } catch (err) {
     console.error('Error creating client:', err);
+    if (err.code === 11000) return res.status(400).json({ error: 'A client with this mobile number already exists.' });
     return res.status(500).json({ error: 'Failed to create client: ' + err.message });
   }
 });
 
-// POST /api/clients/:id/loans - Add a new loan for an existing client
+// ─── POST /api/clients/:id/loans ─────────────────────────────────────────────
 router.post('/:id/loans', authMiddleware, async (req, res) => {
   const clientId = req.params.id;
-  const {
-    amountTaken,
-    duration,
-    startDate = new Date().toISOString().split('T')[0],
-    paymentMode = 'Cash',
-    note
-  } = req.body;
+  const { amountTaken, duration, startDate = getTodayStr(), paymentMode = 'Cash', note } = req.body;
 
   try {
-    const db = await getPool();
-    const [clientRows] = await db.query('SELECT id, name FROM clients WHERE id = ?', [clientId]);
-    if (clientRows.length === 0) {
-      return res.status(404).json({ error: 'Client not found.' });
-    }
+    if (!mongoose.Types.ObjectId.isValid(clientId)) return res.status(400).json({ error: 'Invalid client ID.' });
+    const client = await Client.findById(clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found.' });
 
     const parsedAmount = parseFloat(amountTaken);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
-    }
-
+    if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
     if (!duration || !['weekly', 'fortnight', 'monthly'].includes(duration.toLowerCase())) {
       return res.status(400).json({ error: 'Valid duration is required (weekly, fortnight, monthly).' });
     }
@@ -510,112 +523,68 @@ router.post('/:id/loans', authMiddleware, async (req, res) => {
     const selectedDuration = duration.toLowerCase();
     const dueDate = calculateDueDate(startDate, selectedDuration);
     const durationDays = getDurationDays(selectedDuration);
-
-    // 10% One-time Loan Interest Calculation
     const interestRate = 10.00;
     const interestAmount = Math.round(parsedAmount * (interestRate / 100) * 100) / 100;
     const totalPayable = parsedAmount + interestAmount;
     const initialStatus = evaluateStatus(totalPayable, dueDate);
 
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
+    const loan = await Loan.create({
+      clientId: client._id,
+      amountTaken: parsedAmount, interestRate, interestAmount, totalPayable,
+      duration: selectedDuration, durationDays, startDate, dueDate,
+      totalPaid: 0, remainingAmount: totalPayable, status: initialStatus,
+      note: note || 'New loan cycle'
+    });
 
-      const [loanRes] = await connection.query(`
-        INSERT INTO loan_records (
-          client_id, amount_taken, interest_rate, interest_amount, total_payable,
-          duration, duration_days, start_date, due_date, total_paid, remaining_amount, status, note
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
-      `, [
-        clientId,
-        parsedAmount,
-        interestRate,
-        interestAmount,
-        totalPayable,
-        selectedDuration,
-        durationDays,
-        startDate,
-        dueDate,
-        totalPayable,
-        initialStatus,
-        note || 'New loan cycle'
-      ]);
-      const recordId = loanRes.insertId;
+    await Transaction.create({
+      loanId: loan._id, clientId: client._id,
+      amount: parsedAmount, transactionType: 'disbursement',
+      transactionDate: startDate, remainingAfter: totalPayable,
+      paymentMode, note: note || 'Loan disbursement'
+    });
 
-      await connection.query(`
-        INSERT INTO transactions (record_id, client_id, amount, transaction_type, transaction_date, remaining_after, payment_mode, note)
-        VALUES (?, ?, ?, 'disbursement', ?, ?, ?, ?)
-      `, [recordId, clientId, parsedAmount, startDate, totalPayable, paymentMode, note || 'Loan disbursement']);
-
-      await connection.commit();
-
-      return res.status(201).json({
-        message: 'New loan record added successfully with 10% interest applied',
-        recordId,
-        principalAmount: parsedAmount,
-        interestRate,
-        interestAmount,
-        totalPayable,
-        dueDate,
-        duration: selectedDuration
-      });
-    } catch (err) {
-      await connection.rollback();
-      throw err;
-    } finally {
-      connection.release();
-    }
+    return res.status(201).json({
+      message: 'New loan record added successfully with 10% interest applied',
+      recordId: loan._id.toString(),
+      principalAmount: parsedAmount, interestRate, interestAmount, totalPayable, dueDate,
+      duration: selectedDuration
+    });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to add loan record: ' + err.message });
   }
 });
 
-// PUT /api/clients/:id - Update client personal info
+// ─── PUT /api/clients/:id ─────────────────────────────────────────────────────
 router.put('/:id', authMiddleware, async (req, res) => {
   const clientId = req.params.id;
   const { name, mobileNumber, aadhaarNumber, address, notes } = req.body;
 
   try {
-    const db = await getPool();
-    const [rows] = await db.query('SELECT * FROM clients WHERE id = ?', [clientId]);
-    const existing = rows[0];
-    if (!existing) {
-      return res.status(404).json({ error: 'Client not found.' });
+    if (!mongoose.Types.ObjectId.isValid(clientId)) return res.status(400).json({ error: 'Invalid client ID.' });
+    const existing = await Client.findById(clientId);
+    if (!existing) return res.status(404).json({ error: 'Client not found.' });
+
+    const cleanMobile = mobileNumber ? mobileNumber.replace(/\D/g, '') : existing.mobileNumber;
+    if (cleanMobile && cleanMobile.length < 10) return res.status(400).json({ error: 'Valid 10-digit mobile number required.' });
+
+    if (cleanMobile !== existing.mobileNumber) {
+      const collision = await Client.findOne({ mobileNumber: cleanMobile, _id: { $ne: existing._id } });
+      if (collision) return res.status(400).json({ error: 'Another client is already registered with this mobile number.' });
     }
 
-    const cleanMobile = mobileNumber ? mobileNumber.replace(/\D/g, '') : existing.mobile_number;
-    if (cleanMobile && cleanMobile.length < 10) {
-      return res.status(400).json({ error: 'Valid 10-digit mobile number required.' });
-    }
-
-    if (cleanMobile !== existing.mobile_number) {
-      const [collision] = await db.query('SELECT id FROM clients WHERE mobile_number = ? AND id != ?', [cleanMobile, clientId]);
-      if (collision.length > 0) {
-        return res.status(400).json({ error: 'Another client is already registered with this mobile number.' });
-      }
-    }
-
-    let cleanAadhaar = existing.aadhaar_number;
+    let cleanAadhaar = existing.aadhaarNumber;
     if (aadhaarNumber !== undefined) {
       cleanAadhaar = aadhaarNumber ? aadhaarNumber.replace(/\D/g, '') : null;
-      if (cleanAadhaar && cleanAadhaar.length !== 12) {
-        return res.status(400).json({ error: 'Aadhaar number must be 12 digits.' });
-      }
+      if (cleanAadhaar && cleanAadhaar.length !== 12) return res.status(400).json({ error: 'Aadhaar number must be 12 digits.' });
     }
 
-    await db.query(`
-      UPDATE clients 
-      SET name = ?, mobile_number = ?, aadhaar_number = ?, address = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `, [
-      name ? name.trim() : existing.name,
-      cleanMobile,
-      cleanAadhaar,
-      address !== undefined ? address : existing.address,
-      notes !== undefined ? notes : existing.notes,
-      clientId
-    ]);
+    await Client.findByIdAndUpdate(clientId, {
+      name: name ? name.trim() : existing.name,
+      mobileNumber: cleanMobile,
+      aadhaarNumber: cleanAadhaar,
+      address: address !== undefined ? address : existing.address,
+      notes: notes !== undefined ? notes : existing.notes
+    });
 
     return res.json({ message: 'Client details updated successfully.' });
   } catch (err) {
@@ -623,133 +592,85 @@ router.put('/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// PUT /api/clients/loans/:id - Update loan record details
+// ─── PUT /api/clients/loans/:id ──────────────────────────────────────────────
 router.put('/loans/:id', authMiddleware, async (req, res) => {
   const loanId = req.params.id;
   const { amountTaken, duration, startDate, note } = req.body;
 
   try {
-    const db = await getPool();
-    const [loanRows] = await db.query('SELECT * FROM loan_records WHERE id = ?', [loanId]);
-    const loan = loanRows[0];
-    if (!loan) {
-      return res.status(404).json({ error: 'Loan record not found.' });
-    }
+    if (!mongoose.Types.ObjectId.isValid(loanId)) return res.status(400).json({ error: 'Invalid loan ID.' });
+    const loan = await Loan.findById(loanId);
+    if (!loan) return res.status(404).json({ error: 'Loan record not found.' });
 
-    const parsedAmount = amountTaken !== undefined ? parseFloat(amountTaken) : Number(loan.amount_taken);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
-    }
+    const parsedAmount = amountTaken !== undefined ? parseFloat(amountTaken) : Number(loan.amountTaken);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Amount taken must be greater than 0.' });
 
     const newDuration = (duration || loan.duration).toLowerCase();
-    if (!['weekly', 'fortnight', 'monthly'].includes(newDuration)) {
-      return res.status(400).json({ error: 'Invalid duration specified.' });
-    }
+    if (!['weekly', 'fortnight', 'monthly'].includes(newDuration)) return res.status(400).json({ error: 'Invalid duration specified.' });
 
-    const newStartDate = startDate || loan.start_date;
+    const newStartDate = startDate || loan.startDate;
     const newDueDate = calculateDueDate(newStartDate, newDuration);
     const durationDays = getDurationDays(newDuration);
-
     const interestRate = 10.00;
     const interestAmount = Math.round(parsedAmount * (interestRate / 100) * 100) / 100;
     const totalPayable = parsedAmount + interestAmount;
 
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
+    await Loan.findByIdAndUpdate(loanId, {
+      amountTaken: parsedAmount, interestRate, interestAmount, totalPayable,
+      duration: newDuration, durationDays, startDate: newStartDate, dueDate: newDueDate,
+      note: note !== undefined ? note : loan.note
+    });
 
-      await connection.query(`
-        UPDATE loan_records
-        SET amount_taken = ?, interest_rate = ?, interest_amount = ?, total_payable = ?,
-            duration = ?, duration_days = ?, start_date = ?, due_date = ?, note = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `, [
-        parsedAmount,
-        interestRate,
-        interestAmount,
-        totalPayable,
-        newDuration,
-        durationDays,
-        newStartDate,
-        newDueDate,
-        note !== undefined ? note : loan.note,
-        loanId
-      ]);
-
-      // Update initial disbursement transaction amount & date if exists
-      await connection.query(`
-        UPDATE transactions
-        SET amount = ?, transaction_date = ?
-        WHERE record_id = ? AND transaction_type = 'disbursement'
-      `, [parsedAmount, newStartDate, loanId]);
-
-      await connection.commit();
-    } catch (err) {
-      await connection.rollback();
-      throw err;
-    } finally {
-      connection.release();
-    }
+    // Update initial disbursement transaction
+    await Transaction.findOneAndUpdate(
+      { loanId: loan._id, transactionType: 'disbursement' },
+      { amount: parsedAmount, transactionDate: newStartDate }
+    );
 
     const syncResult = await syncLoanBalances(loanId);
 
-    return res.json({
-      message: 'Loan record updated successfully with 10% interest recalculated',
-      syncResult
-    });
+    return res.json({ message: 'Loan record updated successfully with 10% interest recalculated', syncResult });
   } catch (err) {
     console.error('Error updating loan:', err);
     return res.status(500).json({ error: 'Failed to update loan: ' + err.message });
   }
 });
 
-// DELETE /api/clients/loans/:id - Delete a loan record and its transactions
+// ─── DELETE /api/clients/loans/:id ───────────────────────────────────────────
 router.delete('/loans/:id', authMiddleware, async (req, res) => {
   const loanId = req.params.id;
   try {
-    const db = await getPool();
-    const [loanRows] = await db.query('SELECT * FROM loan_records WHERE id = ?', [loanId]);
-    const loan = loanRows[0];
-    if (!loan) {
-      return res.status(404).json({ error: 'Loan record not found.' });
-    }
+    if (!mongoose.Types.ObjectId.isValid(loanId)) return res.status(400).json({ error: 'Invalid loan ID.' });
+    const loan = await Loan.findById(loanId);
+    if (!loan) return res.status(404).json({ error: 'Loan record not found.' });
 
-    const connection = await db.getConnection();
-    try {
-      await connection.beginTransaction();
-      await connection.query('DELETE FROM transactions WHERE record_id = ?', [loanId]);
-      await connection.query('DELETE FROM loan_records WHERE id = ?', [loanId]);
-      await connection.commit();
-    } catch (err) {
-      await connection.rollback();
-      throw err;
-    } finally {
-      connection.release();
-    }
+    await Transaction.deleteMany({ loanId: loan._id });
+    await Reminder.deleteMany({ loanId: loan._id });
+    await Loan.findByIdAndDelete(loanId);
 
-    await syncAllLoanBalances();
-
-    return res.json({
-      message: `Loan record #${loanId} and associated transactions deleted successfully.`
-    });
+    return res.json({ message: `Loan record and associated transactions deleted successfully.` });
   } catch (err) {
     console.error('Error deleting loan:', err);
     return res.status(500).json({ error: 'Failed to delete loan: ' + err.message });
   }
 });
 
-// DELETE /api/clients/:id - Delete client and cascade records
+// ─── DELETE /api/clients/:id ──────────────────────────────────────────────────
 router.delete('/:id', authMiddleware, async (req, res) => {
   const clientId = req.params.id;
   try {
-    const db = await getPool();
-    const [rows] = await db.query('SELECT * FROM clients WHERE id = ?', [clientId]);
-    const client = rows[0];
-    if (!client) {
-      return res.status(404).json({ error: 'Client not found.' });
-    }
+    if (!mongoose.Types.ObjectId.isValid(clientId)) return res.status(400).json({ error: 'Invalid client ID.' });
+    const client = await Client.findById(clientId);
+    if (!client) return res.status(404).json({ error: 'Client not found.' });
 
-    await db.query('DELETE FROM clients WHERE id = ?', [clientId]);
+    // Cascade delete
+    const loans = await Loan.find({ clientId: client._id }, '_id').lean();
+    const loanIds = loans.map(l => l._id);
+    await Transaction.deleteMany({ loanId: { $in: loanIds } });
+    await Reminder.deleteMany({ clientId: client._id });
+    await Loan.deleteMany({ clientId: client._id });
+    await Client.findByIdAndDelete(clientId);
+
     return res.json({ message: `Client ${client.name} and all related records deleted successfully.` });
   } catch (err) {
     return res.status(500).json({ error: 'Delete failed: ' + err.message });

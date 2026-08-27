@@ -12,6 +12,7 @@ import { ClientDetail } from './pages/ClientDetail';
 import { SearchClient } from './pages/SearchClient';
 import { TransactionsPage } from './pages/TransactionsPage';
 import { AllClients } from './pages/AllClients';
+import { OverdueAccounts } from './pages/OverdueAccounts';
 import { AddClientModal } from './components/AddClientModal';
 import { AddPaymentModal } from './components/AddPaymentModal';
 import { NewLoanModal } from './components/NewLoanModal';
@@ -141,8 +142,8 @@ export default function App() {
           stats={sidebarStats}
         />
 
-        {/* Dynamic Content Area */}
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 min-w-0 max-w-full overflow-x-hidden">
+        {/* Dynamic Content Area — pb-20 for mobile bottom nav */}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 pb-24 lg:pb-10 min-w-0 max-w-full overflow-x-hidden">
           {currentTab === 'dashboard' && (
             <Dashboard
               onNavigate={handleNavigate}
@@ -176,6 +177,14 @@ export default function App() {
               onOpenClientDetail={handleOpenClientDetail}
               onOpenAddClient={() => setIsAddClientOpen(true)}
               onOpenPayment={handleOpenPayment}
+            />
+          )}
+
+          {currentTab === 'overdue' && (
+            <OverdueAccounts
+              onOpenClientDetail={handleOpenClientDetail}
+              onOpenPayment={handleOpenPayment}
+              onOpenAddClient={() => setIsAddClientOpen(true)}
             />
           )}
 

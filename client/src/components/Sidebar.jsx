@@ -1,4 +1,3 @@
-import React from 'react';
 import { 
   LayoutDashboard, 
   UserPlus, 
@@ -9,6 +8,7 @@ import {
   Search, 
   History, 
   AlertCircle,
+  AlertOctagon,
   Clock, 
   Shield, 
   HelpCircle,
@@ -24,30 +24,6 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       badge: null
     },
     {
-      section: 'Active Loan Schedules'
-    },
-    {
-      id: 'weekly',
-      label: 'Weekly (7 Days)',
-      icon: CalendarDays,
-      badge: stats?.weeklyCount || null,
-      badgeColor: 'bg-blue-500/10 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300 border-blue-500/30'
-    },
-    {
-      id: 'fortnight',
-      label: 'Fortnight (14 Days)',
-      icon: CalendarRange,
-      badge: stats?.fortnightCount || null,
-      badgeColor: 'bg-purple-500/10 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300 border-purple-500/30'
-    },
-    {
-      id: 'monthly',
-      label: 'Monthly (30 Days)',
-      icon: Calendar,
-      badge: stats?.monthlyCount || null,
-      badgeColor: 'bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300 border-emerald-500/30'
-    },
-    {
       section: 'Reminders & Schedules'
     },
     {
@@ -55,7 +31,17 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       label: 'History',
       icon: Clock,
       badge: stats?.dueTomorrowCount || null,
-      badgeColor: 'bg-amber-500/10 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300 border-amber-500/30'
+      badgeColor: 'bg-slate-100 text-slate-700 dark:bg-surface-800 dark:text-slate-300 border-slate-300 dark:border-surface-700'
+    },
+    {
+      section: 'Overdue & Collections'
+    },
+    {
+      id: 'overdue',
+      label: 'Overdue',
+      icon: AlertOctagon,
+      badge: stats?.overdueRecordsCount || null,
+      badgeColor: 'bg-rose-500/10 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300 border-rose-500/30 animate-pulse'
     },
     {
       section: 'Records & Auditing'
@@ -131,7 +117,7 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       <div className="pt-4 border-t border-slate-200 dark:border-surface-800/80 space-y-3">
         {stats?.overdueRecordsCount > 0 && (
           <div 
-            onClick={() => handleItemClick('dashboard')}
+            onClick={() => handleItemClick('overdue')}
             className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 dark:bg-rose-500/10 dark:border-rose-500/30 dark:text-rose-300 text-xs flex items-center gap-2 cursor-pointer hover:bg-rose-100 dark:hover:bg-rose-500/15 transition-colors"
           >
             <AlertCircle className="w-4 h-4 text-rose-500 dark:text-rose-400 flex-shrink-0 animate-bounce" />
@@ -155,7 +141,7 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
   return (
     <>
       {/* Desktop Sidebar */}
-      <aside className="hidden lg:block w-64 flex-shrink-0 border-r border-slate-200 dark:border-surface-800/80 bg-white/60 dark:bg-surface-950/40 backdrop-blur-md min-h-[calc(100vh-4rem)]">
+      <aside className="hidden lg:flex lg:flex-col w-64 flex-shrink-0 border-r border-slate-200 dark:border-surface-800/80 bg-white/60 dark:bg-surface-950/40 backdrop-blur-md sticky top-16 self-start h-[calc(100vh-4rem)] overflow-y-auto">
         {content}
       </aside>
 

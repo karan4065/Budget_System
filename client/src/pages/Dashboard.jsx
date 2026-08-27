@@ -399,10 +399,10 @@ export function Dashboard({ onNavigate, onOpenAddClient, onOpenClientDetail, onO
 
           <div className="pt-4 mt-3 border-t border-slate-200 dark:border-surface-800/80 text-right">
             <button
-              onClick={() => onNavigate('all-clients')}
-              className="text-xs font-semibold text-brand-600 dark:text-brand-400 hover:text-brand-500 dark:hover:text-brand-300 inline-flex items-center gap-1"
+              onClick={() => onNavigate('overdue')}
+              className="text-xs font-semibold text-rose-600 dark:text-rose-400 hover:text-rose-500 inline-flex items-center gap-1"
             >
-              <span>View all clients</span>
+              <span>View all overdue accounts</span>
               <ChevronRight className="w-3.5 h-3.5" />
             </button>
           </div>

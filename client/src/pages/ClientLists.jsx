@@ -27,7 +27,12 @@ import {
   RefreshCw, 
   ExternalLink, 
   MessageSquare,
-  History
+  History,
+  Bell,
+  Smartphone,
+  Copy,
+  Check,
+  X
 } from 'lucide-react';
 
 export function ClientLists({ 
@@ -46,6 +51,10 @@ export function ClientLists({
   const [clients, setClients] = useState([]);
   const [loading, setLoading] = useState(true);
   const [sendingReminderId, setSendingReminderId] = useState(null);
+  const [reminderChooserData, setReminderChooserData] = useState(null);
+  const [pendingReminder, setPendingReminder] = useState(null);
+  const [confirmingReminder, setConfirmingReminder] = useState(false);
+  const [copiedMessage, setCopiedMessage] = useState(false);
 
   // Sync if initialDuration prop changes from navigation
   useEffect(() => {
@@ -81,27 +90,47 @@ export function ClientLists({
     fetchClients();
   }, [activeDuration, statusFilter, searchQuery, refreshSignal]);
 
-  const [pendingReminder, setPendingReminder] = useState(null);
-  const [confirmingReminder, setConfirmingReminder] = useState(false);
-
-  const handleSendReminder = async (e, loanId, clientName) => {
+  const handleOpenReminderChooser = (e, loanId, clientName, mobileNumber) => {
     e.stopPropagation();
+    if (!loanId) return;
+    setReminderChooserData({ loanId, clientName, mobileNumber });
+  };
+
+  const handleTriggerReminder = async (loanId, channel = 'whatsapp') => {
     if (!loanId) return;
     setSendingReminderId(loanId);
     try {
       const res = await api.prepareManualReminder(loanId);
-      if (res.directWhatsAppUrl) {
+
+      // Open delivery channel
+      if (channel === 'whatsapp' && res.directWhatsAppUrl) {
         window.open(res.directWhatsAppUrl, '_blank', 'noopener,noreferrer');
+      } else if (channel === 'sms') {
+        const recipient = res.phoneNumber || res.recipient || reminderChooserData?.mobileNumber || '';
+        const cleanDigits = String(recipient).replace(/\D/g, '');
+        const phoneFormatted = cleanDigits.length === 10 ? `+91${cleanDigits}` : (cleanDigits ? `+${cleanDigits}` : '');
+        const smsUrl = `sms:${phoneFormatted}?body=${encodeURIComponent(res.messageText)}`;
+        
+        const link = document.createElement('a');
+        link.href = smsUrl;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
       }
+
+      setReminderChooserData(null);
       setPendingReminder({
         loanId,
-        clientName: res.clientName || clientName || 'Client',
+        channel,
+        clientName: res.clientName || reminderChooserData?.clientName || 'Client',
+        phoneNumber: res.recipient || reminderChooserData?.mobileNumber,
         messageText: res.messageText,
         reminderType: res.reminderType
       });
-      success(`WhatsApp opened for ${res.clientName || clientName}. Send the message and confirm below.`);
+
+      success(`${channel === 'sms' ? 'SMS' : 'WhatsApp'} message opened! Click "Record as 1 Reminder" to save in history.`);
     } catch (err) {
-      error(err.message || 'Failed to prepare WhatsApp reminder.');
+      error(err.message || `Failed to prepare ${channel === 'sms' ? 'SMS' : 'WhatsApp'} reminder.`);
     } finally {
       setSendingReminderId(null);
     }
@@ -113,9 +142,10 @@ export function ClientLists({
     try {
       const res = await api.confirmReminderLog(pendingReminder.loanId, {
         messageText: pendingReminder.messageText,
-        reminderType: pendingReminder.reminderType
+        reminderType: pendingReminder.reminderType,
+        channel: pendingReminder.channel
       });
-      success(res.message || 'WhatsApp reminder successfully logged (+1)!');
+      success(res.message || `${pendingReminder.channel === 'sms' ? 'SMS' : 'WhatsApp'} reminder confirmed (+1)!`);
       setPendingReminder(null);
       triggerRefresh();
       fetchClients();
@@ -260,7 +290,7 @@ export function ClientLists({
           <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
           <input
             type="text"
-            placeholder="Search by client name, mobile number, or Aadhaar..."
+            placeholder="Search by Client ID (e.g. 1), name, mobile, or Aadhaar..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-10 pr-4 py-2.5 rounded-xl bg-white dark:bg-surface-900/90 border border-slate-200 dark:border-surface-700/80 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-brand-500 text-sm shadow-inner transition-all"
@@ -321,18 +351,19 @@ export function ClientLists({
         <>
           {/* Desktop & Tablet Table (Hidden on Mobile) */}
           <div className="hidden md:block glass-card rounded-2xl border border-slate-200 dark:border-surface-700/60 shadow-xl overflow-hidden">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-100 dark:bg-surface-950/80 border-b border-slate-200 dark:border-surface-800 text-slate-500 dark:text-slate-400 uppercase font-semibold tracking-wider">
-                <tr>
-                  <th className="px-5 py-3.5">Client Details</th>
-                  <th className="px-5 py-3.5">Amount Taken</th>
-                  <th className="px-5 py-3.5">Start Date</th>
-                  <th className="px-5 py-3.5">Due Date</th>
-                  <th className="px-5 py-3.5">Outstanding</th>
-                  <th className="px-5 py-3.5">Status</th>
-                  <th className="px-5 py-3.5 text-right">Actions</th>
-                </tr>
-              </thead>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-100 dark:bg-surface-950/80 border-b border-slate-200 dark:border-surface-800 text-slate-500 dark:text-slate-400 uppercase font-semibold tracking-wider">
+                  <tr>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Client Details</th>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Amount Taken</th>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Start Date</th>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Due Date</th>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Outstanding</th>
+                    <th className="px-5 py-3.5 whitespace-nowrap">Status</th>
+                    <th className="px-5 py-3.5 text-right whitespace-nowrap">Actions</th>
+                  </tr>
+                </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-surface-800/80">
                 {clients.map(client => {
                   const statusInfo = getDueStatusInfo(client.dueDate, client.remainingAmount);
@@ -345,15 +376,20 @@ export function ClientLists({
                       onClick={() => onOpenClientDetail(client.id)}
                     >
                       {/* Name & Mobile */}
-                      <td className="px-5 py-4">
+                      <td className="px-5 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-3">
-                          <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-brand-600/20 to-indigo-600/20 dark:from-brand-600/30 dark:to-indigo-600/30 border border-brand-500/30 text-brand-600 dark:text-brand-300 font-bold flex items-center justify-center text-sm shadow-inner">
+                          <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-brand-600/20 to-indigo-600/20 dark:from-brand-600/30 dark:to-indigo-600/30 border border-brand-500/30 text-brand-600 dark:text-brand-300 font-bold flex items-center justify-center text-sm shadow-inner flex-shrink-0">
                             {client.name.charAt(0)}
                           </div>
                           <div>
-                            <p className="font-bold text-sm text-slate-900 dark:text-white group-hover:text-brand-600 dark:group-hover:text-brand-300 transition-colors">
-                              {client.name}
-                            </p>
+                            <div className="flex items-center gap-2">
+                              <p className="font-bold text-sm text-slate-900 dark:text-white group-hover:text-brand-600 dark:group-hover:text-brand-300 transition-colors">
+                                {client.name}
+                              </p>
+                              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 dark:bg-surface-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-surface-700">
+                                ID #{client.displayId || client.clientNo || client.id}
+                              </span>
+                            </div>
                             <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
                               <span>+91 {client.mobileNumber}</span>
                               {client.maskedAadhaar && (
@@ -365,7 +401,7 @@ export function ClientLists({
                       </td>
 
                       {/* Amount Taken */}
-                      <td className="px-5 py-4 font-mono font-bold text-slate-800 dark:text-slate-200 text-sm">
+                      <td className="px-5 py-4 font-mono font-bold text-slate-800 dark:text-slate-200 text-sm whitespace-nowrap">
                         {formatCurrency(client.amountTaken)}
                         <span className="block text-[10px] font-normal text-slate-500 dark:text-slate-400 uppercase">
                           {getDurationLabel(client.duration)}
@@ -373,12 +409,12 @@ export function ClientLists({
                       </td>
 
                       {/* Start Date */}
-                      <td className="px-5 py-4 text-slate-700 dark:text-slate-300">
+                      <td className="px-5 py-4 text-slate-700 dark:text-slate-300 whitespace-nowrap">
                         {formatDate(client.startDate)}
                       </td>
 
                       {/* Due Date & relative badge */}
-                      <td className="px-5 py-4">
+                      <td className="px-5 py-4 whitespace-nowrap">
                         <div className="font-semibold text-slate-800 dark:text-slate-200">
                           {formatDate(client.dueDate)}
                         </div>
@@ -388,7 +424,7 @@ export function ClientLists({
                       </td>
 
                       {/* Outstanding */}
-                      <td className="px-5 py-4 font-mono">
+                      <td className="px-5 py-4 font-mono whitespace-nowrap">
                         <div className={`font-bold text-sm ${client.remainingAmount > 0 ? (isOverdue ? 'text-rose-600 dark:text-rose-400' : 'text-amber-600 dark:text-amber-300') : 'text-emerald-600 dark:text-emerald-400'}`}>
                           {formatCurrency(client.remainingAmount)}
                         </div>
@@ -398,7 +434,7 @@ export function ClientLists({
                       </td>
 
                       {/* Status */}
-                      <td className="px-5 py-4">
+                      <td className="px-5 py-4 whitespace-nowrap">
                         <span className={`px-2.5 py-1 rounded-full text-[11px] font-bold uppercase tracking-wider ${
                           client.status === 'completed'
                             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30'
@@ -411,16 +447,16 @@ export function ClientLists({
                       </td>
 
                       {/* Actions */}
-                      <td className="px-5 py-4 text-right space-x-2" onClick={(e) => e.stopPropagation()}>
+                      <td className="px-5 py-4 text-right space-x-2 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
                         {client.latestRecordId && client.remainingAmount > 0 && (
                           <button
-                            onClick={(e) => handleSendReminder(e, client.latestRecordId, client.name)}
+                            onClick={(e) => handleOpenReminderChooser(e, client.latestRecordId, client.name, client.mobileNumber)}
                             disabled={sendingReminderId === client.latestRecordId}
-                            title="Send WhatsApp Payment Reminder"
+                            title="Send Reminder via WhatsApp or SMS"
                             className="p-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 dark:bg-emerald-500/10 dark:hover:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 transition-all inline-flex items-center gap-1.5 text-xs font-semibold"
                           >
-                            <MessageSquare className={`w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 ${sendingReminderId === client.latestRecordId ? 'animate-pulse' : ''}`} />
-                            <span className="hidden xl:inline">WhatsApp</span>
+                            <Bell className={`w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 ${sendingReminderId === client.latestRecordId ? 'animate-pulse' : ''}`} />
+                            <span className="hidden xl:inline">Reminder</span>
                           </button>
                         )}
 
@@ -429,9 +465,15 @@ export function ClientLists({
                             onClick={() => onOpenPayment({
                               id: client.latestRecordId,
                               amountTaken: client.amountTaken,
-                              totalPaid: client.totalPaid,
+                              interestAmount: client.interestAmount,
+                              totalPayable: client.totalPayable,
                               remainingAmount: client.remainingAmount,
-                              dueDate: client.dueDate
+                              totalPaid: client.totalPaid,
+                              duration: client.duration,
+                              dueDate: client.dueDate,
+                              daysOverdue: client.daysOverdue,
+                              overdueWeeks: client.overdueWeeks,
+                              overdueInterest: client.overdueInterest
                             }, client)}
                             title="Record Payment"
                             className="p-2 rounded-lg bg-purple-50 hover:bg-purple-100 text-purple-700 dark:bg-purple-500/10 dark:hover:bg-purple-500/20 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30 transition-all inline-flex items-center gap-1 text-xs font-semibold"
@@ -455,6 +497,7 @@ export function ClientLists({
               </tbody>
             </table>
           </div>
+        </div>
 
           {/* Mobile Cards View (Visible on Mobile) */}
           <div className="md:hidden space-y-3">
@@ -471,7 +514,12 @@ export function ClientLists({
                   {/* Top Bar: Name, Status & Mobile */}
                   <div className="flex items-start justify-between gap-2">
                     <div>
-                      <h3 className="font-bold text-base text-slate-900 dark:text-white">{client.name}</h3>
+                      <div className="flex items-center gap-2">
+                        <h3 className="font-bold text-base text-slate-900 dark:text-white">{client.name}</h3>
+                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 dark:bg-surface-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-surface-700">
+                          #{client.displayId || client.clientNo || client.id}
+                        </span>
+                      </div>
                       <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-500 dark:text-slate-400 font-mono">
                         <a 
                           href={`tel:${client.mobileNumber}`} 
@@ -525,13 +573,13 @@ export function ClientLists({
                     <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
                       {client.latestRecordId && client.remainingAmount > 0 && (
                         <button
-                          onClick={(e) => handleSendReminder(e, client.latestRecordId, client.name)}
+                          onClick={(e) => handleOpenReminderChooser(e, client.latestRecordId, client.name, client.mobileNumber)}
                           disabled={sendingReminderId === client.latestRecordId}
-                          title="Send WhatsApp Reminder"
+                          title="Send Reminder via WhatsApp or SMS"
                           className="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/50 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/30 font-bold text-xs inline-flex items-center gap-1"
                         >
-                          <MessageSquare className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                          <span>WhatsApp</span>
+                          <Bell className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                          <span>Reminder</span>
                         </button>
                       )}
 
@@ -540,9 +588,15 @@ export function ClientLists({
                           onClick={() => onOpenPayment({
                             id: client.latestRecordId,
                             amountTaken: client.amountTaken,
-                            totalPaid: client.totalPaid,
+                            interestAmount: client.interestAmount,
+                            totalPayable: client.totalPayable,
                             remainingAmount: client.remainingAmount,
-                            dueDate: client.dueDate
+                            totalPaid: client.totalPaid,
+                            duration: client.duration,
+                            dueDate: client.dueDate,
+                            daysOverdue: client.daysOverdue,
+                            overdueWeeks: client.overdueWeeks,
+                            overdueInterest: client.overdueInterest
                           }, client)}
                           className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-bold text-xs shadow transition-all"
                         >
@@ -564,20 +618,121 @@ export function ClientLists({
         </>
       )}
 
-      {/* WhatsApp Return & Log Confirmation Modal */}
+      {/* Reminder Channel Selector Modal (WhatsApp vs SMS) */}
+      {reminderChooserData && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
+          <div className="glass-card max-w-sm w-full rounded-2xl p-6 border border-slate-200 dark:border-surface-700/80 shadow-2xl space-y-5 bg-white dark:bg-surface-900 animate-scale-in">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-surface-800">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-brand-500/10 text-brand-600 dark:text-brand-400 flex items-center justify-center">
+                  <Bell className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">Send Reminder</h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">Choose message delivery method</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReminderChooserData(null)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              {/* Option 1: WhatsApp */}
+              <button
+                type="button"
+                disabled={sendingReminderId !== null}
+                onClick={() => handleTriggerReminder(reminderChooserData.loanId, 'whatsapp')}
+                className="w-full p-4 rounded-xl border border-emerald-200 dark:border-emerald-500/30 bg-emerald-50/50 hover:bg-emerald-50 dark:bg-emerald-950/20 dark:hover:bg-emerald-950/40 text-left flex items-center gap-3.5 transition-all group active:scale-95"
+              >
+                <div className="w-10 h-10 rounded-xl bg-emerald-500 text-white flex items-center justify-center shadow-md shadow-emerald-500/30 flex-shrink-0 group-hover:scale-105 transition-transform">
+                  <MessageSquare className="w-5 h-5" />
+                </div>
+                <div className="flex-1">
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-white group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors">
+                    WhatsApp Reminder
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Send via WhatsApp chat window
+                  </p>
+                </div>
+              </button>
+
+              {/* Option 2: SMS / Text Message */}
+              <button
+                type="button"
+                disabled={sendingReminderId !== null}
+                onClick={() => handleTriggerReminder(reminderChooserData.loanId, 'sms')}
+                className="w-full p-4 rounded-xl border border-blue-200 dark:border-blue-500/30 bg-blue-50/50 hover:bg-blue-50 dark:bg-blue-950/20 dark:hover:bg-blue-950/40 text-left flex items-center gap-3.5 transition-all group active:scale-95"
+              >
+                <div className="w-10 h-10 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow-md shadow-blue-600/30 flex-shrink-0 group-hover:scale-105 transition-transform">
+                  <Smartphone className="w-5 h-5" />
+                </div>
+                <div className="flex-1">
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-white group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                    SMS / Text Message
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Send direct SMS for keypad / non-Android phones
+                  </p>
+                </div>
+              </button>
+            </div>
+
+            <p className="text-[11px] text-center text-slate-400 dark:text-slate-500">
+              Recipient: {reminderChooserData.clientName} (+91 {reminderChooserData.mobileNumber})
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Reminder Confirmation / Logging Modal */}
       {pendingReminder && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
-          <div className="glass-card max-w-md w-full rounded-2xl p-6 border border-emerald-500/30 shadow-2xl space-y-4 bg-white dark:bg-surface-900 text-center animate-scale-in">
-            <div className="w-12 h-12 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center mx-auto text-xl">
-              <MessageSquare className="w-6 h-6" />
+          <div className="glass-card max-w-md w-full rounded-2xl p-6 border border-slate-200 dark:border-surface-700/80 shadow-2xl space-y-4 bg-white dark:bg-surface-900 text-center animate-scale-in">
+            <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto text-xl ${
+              pendingReminder.channel === 'sms'
+                ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+            }`}>
+              {pendingReminder.channel === 'sms' ? <Smartphone className="w-6 h-6" /> : <MessageSquare className="w-6 h-6" />}
             </div>
 
             <div>
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase mb-2 bg-slate-100 dark:bg-surface-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-surface-700">
+                {pendingReminder.channel === 'sms' ? 'SMS Text Message' : 'WhatsApp Reminder'}
+              </div>
               <h3 className="text-lg font-bold text-slate-900 dark:text-white">
-                Confirm WhatsApp Reminder Sent
+                Confirm Reminder Sent
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5 leading-relaxed">
-                WhatsApp was opened for <strong>{pendingReminder.clientName}</strong>. If you sent the reminder message, confirm below to record <strong>1 Reminder</strong> in history.
+                Message was prepared for <strong>{pendingReminder.clientName}</strong> (+91 {pendingReminder.phoneNumber}). If sent, confirm below to record in reminder history.
+              </p>
+            </div>
+
+            {/* Message Preview Box with Copy Button */}
+            <div className="bg-slate-50 dark:bg-surface-950 p-3 rounded-xl border border-slate-200 dark:border-surface-800 text-left text-xs space-y-2">
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Message Content:</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(pendingReminder.messageText);
+                    setCopiedMessage(true);
+                    setTimeout(() => setCopiedMessage(false), 2000);
+                  }}
+                  className="inline-flex items-center gap-1 text-brand-600 dark:text-brand-400 hover:underline font-semibold"
+                >
+                  {copiedMessage ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedMessage ? 'Copied!' : 'Copy Message'}</span>
+                </button>
+              </div>
+              <p className="text-slate-700 dark:text-slate-300 font-mono text-[11px] leading-relaxed select-all">
+                {pendingReminder.messageText}
               </p>
             </div>
 
@@ -587,15 +742,19 @@ export function ClientLists({
                 onClick={() => setPendingReminder(null)}
                 className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-surface-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-surface-800 transition-colors"
               >
-                No, Cancel
+                Cancel
               </button>
               <button
                 type="button"
                 disabled={confirmingReminder}
                 onClick={handleConfirmReminderSent}
-                className="flex-1 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/30 active:scale-95 transition-all disabled:opacity-50 inline-flex items-center justify-center gap-1.5"
+                className={`flex-1 py-2.5 rounded-xl text-white text-xs font-bold shadow-lg active:scale-95 transition-all disabled:opacity-50 inline-flex items-center justify-center gap-1.5 ${
+                  pendingReminder.channel === 'sms'
+                    ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-600/30'
+                    : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/30'
+                }`}
               >
-                <span>{confirmingReminder ? 'Recording...' : 'Yes, Record as 1 Reminder'}</span>
+                <span>{confirmingReminder ? 'Recording...' : 'Yes, Record as 1 Reminder (+1)'}</span>
               </button>
             </div>
           </div>
