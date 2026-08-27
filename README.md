@@ -6,10 +6,6 @@ A production-ready, responsive, and secure **Budget & Loan Management System** b
 
 ## 🔐 Single Admin Credentials
 
-| Role | Email | Password |
-| :--- | :--- | :--- |
-| **Administrator** | `sumit@gmail.com` | `sumit@1234` |
-
 > 🔒 **Security Notice:** There is **NO public registration** and **NO customer dashboard**. Only the designated administrator can access the system.
 
 ---
