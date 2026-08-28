@@ -55,6 +55,19 @@ export function getDurationDays(duration) {
   return 30;
 }
 
+export function getOrdinal(n) {
+  const num = parseInt(n, 10);
+  if (isNaN(num)) return `${n}`;
+  const s = ['th', 'st', 'nd', 'rd'];
+  const v = num % 100;
+  return num + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+export function getLoanOrdinalLabel(loanNumber) {
+  if (!loanNumber) return 'Loan';
+  return `${getOrdinal(loanNumber)} Loan`;
+}
+
 export function getDurationLabel(duration) {
   switch ((duration || '').toLowerCase()) {
     case 'weekly':

@@ -19,11 +19,13 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
     isInterestRenewal: false,
     extendDueDate: false
   });
+  const [markAsPendingAndComplete, setMarkAsPendingAndComplete] = useState(false);
   const [openReceiptAfter, setOpenReceiptAfter] = useState(true);
   const [loading, setLoading] = useState(false);
 
   // Auto-prefill when opened via a quick-pay button (_quickPayType)
   useEffect(() => {
+    setMarkAsPendingAndComplete(false);
     if (!isOpen || !loanRecord) return;
     const qType = loanRecord._quickPayType;
     const qAmount = loanRecord._quickPayAmount;
@@ -101,7 +103,8 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
     projectedRemaining = remainingPayable + parsedEnteredAmount;
   }
 
-  const isFullSettlement = formData.transactionType === 'payment' && parsedEnteredAmount >= remainingPayable && remainingPayable > 0;
+  const isExceeding = formData.transactionType === 'payment' && !formData.isInterestRenewal && remainingPayable > 0 && parsedEnteredAmount > remainingPayable;
+  const isFullSettlement = formData.transactionType === 'payment' && parsedEnteredAmount === remainingPayable && remainingPayable > 0;
   const isInterestOnlyPayment = formData.isInterestRenewal || (formData.transactionType === 'payment' && parsedEnteredAmount === interestAmount);
 
   const handleSelectInterestOnly = () => {
@@ -124,6 +127,32 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
       extendDueDate: false,
       note: `Full settlement (Principal ${formatCurrency(principal)} + Interest ${formatCurrency(interestAmount)}) complete`
     }));
+  };
+
+  const handleAmountChange = (e) => {
+    const val = e.target.value;
+    if (val === '') {
+      setFormData(p => ({ ...p, amount: '' }));
+      return;
+    }
+    const num = parseFloat(val);
+    if (formData.transactionType === 'payment' && !formData.isInterestRenewal && remainingPayable > 0) {
+      if (!isNaN(num) && num > remainingPayable) {
+        // If user enters more than total payable, automatically make it as full payment amount
+        setFormData(p => ({ ...p, amount: String(remainingPayable) }));
+        return;
+      }
+    }
+    setFormData(p => ({ ...p, amount: val }));
+  };
+
+  const handleAmountBlur = () => {
+    if (formData.transactionType === 'payment' && !formData.isInterestRenewal && remainingPayable > 0) {
+      const num = parseFloat(formData.amount);
+      if (!isNaN(num) && num > remainingPayable) {
+        setFormData(p => ({ ...p, amount: String(remainingPayable) }));
+      }
+    }
   };
 
   const handleSubmit = async (e) => {
@@ -197,18 +226,38 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
         }
       } else {
         // Single loan transaction
+        const pendingDiff = Math.max(0, remainingPayable - parsedEnteredAmount);
         res = await api.createTransaction({
           recordId: loanRecord.id,
           amount: parsedEnteredAmount,
           transactionType: formData.transactionType,
           transactionDate: formData.transactionDate,
           paymentMode: formData.paymentMode,
-          note: formData.note.trim(),
+          note: formData.note.trim() || (markAsPendingAndComplete ? `Payment ₹${parsedEnteredAmount} + Remaining ₹${pendingDiff} marked as pending` : ''),
           isInterestRenewal: formData.isInterestRenewal,
-          extendDueDate: formData.extendDueDate
+          extendDueDate: formData.extendDueDate,
+          markAsPendingAndComplete: markAsPendingAndComplete
         });
 
-        if (formData.isInterestRenewal) {
+        // When marking remaining as pending and completing loan, create the adjustment transaction to balance out remaining amount
+        if (markAsPendingAndComplete && pendingDiff > 0 && formData.transactionType === 'payment' && !formData.isInterestRenewal) {
+          try {
+            await api.createTransaction({
+              recordId: loanRecord.id,
+              amount: pendingDiff,
+              transactionType: 'adjustment',
+              transactionDate: formData.transactionDate,
+              paymentMode: formData.paymentMode,
+              note: `Settlement Discount / Remaining ₹${pendingDiff} marked as pending (Loan completed)`
+            });
+          } catch (adjErr) {
+            console.warn('Note: Adjustment transaction sync:', adjErr.message);
+          }
+        }
+
+        if (markAsPendingAndComplete) {
+          success(`Payment of ${formatCurrency(parsedEnteredAmount)} recorded! Loan completed with ${formatCurrency(pendingDiff)} marked as pending.`);
+        } else if (formData.isInterestRenewal) {
           success(`Interest payment of ${formatCurrency(parsedEnteredAmount)} recorded! Loan due date extended to ${res.newDueDate || previewNewDueDate}.`);
         } else {
           success(`Payment of ${formatCurrency(parsedEnteredAmount)} recorded successfully!`);
@@ -226,11 +275,11 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
           transactionDate: formData.transactionDate,
           transactionType: formData.transactionType,
           paymentMode: formData.paymentMode,
-          remainingAfter: projectedRemaining,
+          remainingAfter: markAsPendingAndComplete ? 0 : projectedRemaining,
           loanAmount: principal,
           totalPayable: totalPayable,
           dueDate: res?.newDueDate || loanRecord.dueDate || loanRecord.due_date,
-          note: formData.note
+          note: formData.note || (markAsPendingAndComplete ? `Loan Completed (₹${remainingPayable - parsedEnteredAmount} Pending Amount)` : '')
         });
       }
 
@@ -394,16 +443,19 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
 
               {/* Incremental Quick Select chips */}
               <div className="grid grid-cols-4 gap-1.5 sm:gap-2">
-                {[500, 1000, 2000, 5000].map(val => (
-                  <button
-                    key={val}
-                    type="button"
-                    onClick={() => setFormData(p => ({ ...p, amount: val.toString() }))}
-                    className="py-1.5 px-1 text-xs font-semibold bg-slate-50 hover:bg-slate-100 dark:bg-surface-950 dark:hover:bg-surface-800 border border-slate-200 dark:border-surface-700 rounded-lg text-slate-700 dark:text-slate-300 transition-colors text-center truncate"
-                  >
-                    +{formatCurrency(val)}
-                  </button>
-                ))}
+                {[500, 1000, 2000, 5000].map(val => {
+                  const targetAmt = remainingPayable > 0 ? Math.min(remainingPayable, val) : val;
+                  return (
+                    <button
+                      key={val}
+                      type="button"
+                      onClick={() => setFormData(p => ({ ...p, amount: targetAmt.toString() }))}
+                      className="py-1.5 px-1 text-xs font-semibold bg-slate-50 hover:bg-slate-100 dark:bg-surface-950 dark:hover:bg-surface-800 border border-slate-200 dark:border-surface-700 rounded-lg text-slate-700 dark:text-slate-300 transition-colors text-center truncate"
+                    >
+                      +{formatCurrency(val)}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -411,45 +463,110 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
             <div>
               <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1.5 flex items-center justify-between">
                 <span>Payment Amount (₹) <span className="text-rose-500">*</span></span>
-                {parsedEnteredAmount > 0 && (
+                {parsedEnteredAmount > 0 && !isExceeding && (
                   <span className="text-xs text-brand-600 dark:text-brand-300 font-semibold">{formatCurrency(parsedEnteredAmount)}</span>
+                )}
+                {remainingPayable > 0 && (
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">
+                    Max: {formatCurrency(remainingPayable)}
+                  </span>
                 )}
               </label>
               <div className="relative">
-                <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-400 font-bold">₹</span>
+                <span className={`absolute inset-y-0 left-0 pl-3.5 flex items-center font-bold ${
+                  isExceeding ? 'text-rose-500' : 'text-slate-400'
+                }`}>₹</span>
                 <input
                   type="number"
                   min="1"
+                  max={remainingPayable > 0 ? remainingPayable : undefined}
                   step="any"
                   required
-                  placeholder="Enter amount (e.g. 250, 2750)"
+                  placeholder={`Enter amount (max ${remainingPayable})`}
                   value={formData.amount}
-                  onChange={(e) => setFormData(p => ({ ...p, amount: e.target.value }))}
-                  className="w-full pl-9 pr-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-surface-950 border border-slate-200 dark:border-surface-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-brand-500 text-base sm:text-lg font-bold transition-all"
+                  onChange={handleAmountChange}
+                  onBlur={handleAmountBlur}
+                  className={`w-full pl-9 pr-3.5 py-2.5 rounded-xl border text-base sm:text-lg font-bold transition-all focus:outline-none ${
+                    isExceeding
+                      ? 'border-rose-500 bg-rose-50/50 dark:bg-rose-950/20 text-rose-600 dark:text-rose-300 focus:border-rose-600'
+                      : 'bg-slate-50 dark:bg-surface-950 border-slate-200 dark:border-surface-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:border-brand-500'
+                  }`}
                 />
               </div>
+
+              {isExceeding && (
+                <div className="flex items-center gap-1.5 text-xs font-bold text-rose-600 dark:text-rose-400 mt-1.5 animate-fade-in bg-rose-50 dark:bg-rose-950/30 p-2.5 rounded-lg border border-rose-200 dark:border-rose-500/30">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  <span>Invalid amount! You cannot enter more than the remaining loan balance of {formatCurrency(remainingPayable)}.</span>
+                </div>
+              )}
             </div>
+
+            {/* Pending Balance / Close Loan Option when payment is less than total payable */}
+            {parsedEnteredAmount > 0 && parsedEnteredAmount < remainingPayable && !formData.isInterestRenewal && formData.transactionType === 'payment' && (
+              <div className={`p-3 sm:p-3.5 rounded-xl border transition-all ${
+                markAsPendingAndComplete 
+                  ? 'border-amber-400 bg-amber-50/80 dark:border-amber-500/50 dark:bg-amber-950/40 shadow-sm' 
+                  : 'border-slate-200 dark:border-surface-800 bg-slate-50/70 dark:bg-surface-950/40 hover:border-slate-300 dark:hover:border-surface-700'
+              }`}>
+                <label className="flex items-start gap-3 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={markAsPendingAndComplete}
+                    onChange={(e) => setMarkAsPendingAndComplete(e.target.checked)}
+                    className="w-4 h-4 mt-0.5 rounded text-amber-600 bg-white dark:bg-surface-950 border-slate-300 dark:border-surface-700 focus:ring-amber-500 cursor-pointer"
+                  />
+                  <div className="flex-1">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-slate-900 dark:text-white">
+                        Mark Remaining ({formatCurrency(remainingPayable - parsedEnteredAmount)}) as Pending & Complete Loan
+                      </span>
+                      {markAsPendingAndComplete && (
+                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-500/30">
+                          Complete Loan
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-600 dark:text-slate-400 mt-0.5">
+                      Closes and completes this loan now. The unpaid balance of <strong>{formatCurrency(remainingPayable - parsedEnteredAmount)}</strong> will be recorded as pending amount on the client profile.
+                    </p>
+                  </div>
+                </label>
+              </div>
+            )}
 
             {/* Live Remaining Balance Projection Card */}
             {parsedEnteredAmount > 0 && (
               <div className={`p-3.5 rounded-xl border flex items-center justify-between text-xs transition-all ${
-                isFullSettlement 
+                isFullSettlement
                   ? 'bg-emerald-50 border-emerald-200 text-emerald-800 dark:bg-emerald-950/40 dark:border-emerald-500/40 dark:text-emerald-300' 
+                  : markAsPendingAndComplete
+                  ? 'bg-amber-50 border-amber-200 text-amber-900 dark:bg-amber-950/40 dark:border-amber-500/40 dark:text-amber-200'
                   : isInterestOnlyPayment
                   ? 'bg-amber-50 border-amber-200 text-amber-800 dark:bg-amber-950/40 dark:border-amber-500/40 dark:text-amber-300'
                   : 'bg-brand-50 border-brand-200 text-brand-800 dark:bg-brand-950/30 dark:border-brand-500/30 dark:text-brand-300'
               }`}>
                 <div>
                   <p className="font-semibold text-slate-600 dark:text-slate-300">
-                    {isInterestOnlyPayment ? 'New Cycle Total Payable (Principal + 10% Int):' : 'Remaining Balance After Payment:'}
+                    {isInterestOnlyPayment 
+                      ? 'New Cycle Total Payable (Principal + 10% Int):' 
+                      : markAsPendingAndComplete 
+                      ? 'Pending Balance Saved (Loan Completed):' 
+                      : 'Remaining Balance After Payment:'}
                   </p>
                   <p className="text-base font-bold font-mono mt-0.5">
-                    {formatCurrency(projectedRemaining)}
+                    {markAsPendingAndComplete
+                      ? formatCurrency(remainingPayable - parsedEnteredAmount)
+                      : formatCurrency(projectedRemaining)}
                   </p>
                 </div>
                 {isFullSettlement ? (
                   <span className="px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-500/40 font-bold uppercase tracking-wider text-[10px]">
                     Loan Completed! 🎉
+                  </span>
+                ) : markAsPendingAndComplete ? (
+                  <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300 border border-amber-300 dark:border-amber-500/40 font-bold uppercase tracking-wider text-[10px]">
+                    Loan Completed ({formatCurrency(remainingPayable - parsedEnteredAmount)} Pending) ✨
                   </span>
                 ) : isInterestOnlyPayment ? (
                   <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-500/20 dark:text-amber-300 border border-amber-300 dark:border-amber-500/40 font-bold uppercase tracking-wider text-[10px]">
@@ -565,8 +682,8 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
             </button>
             <button
               type="submit"
-              disabled={loading}
-              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-600/30 active:scale-95 disabled:opacity-50 transition-all"
+              disabled={loading || isExceeding || parsedEnteredAmount <= 0}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-lg shadow-emerald-600/30 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
             >
               {loading ? (
                 <>

@@ -20,8 +20,31 @@ function normalizePhoneNumber(phone) {
 /**
  * Format dynamic reminder message content
  */
-function getReminderMessageText(reminderType, { clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal }) {
+function getReminderMessageText(reminderType, { clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal, loansList }) {
   const name = clientName || 'Valued Client';
+
+  // If there are multiple active loans for this client, format single consolidated message
+  if (loansList && Array.isArray(loansList) && loansList.length > 1) {
+    const loanLines = loansList.map((l, i) => {
+      const lAmt = Number(l.remainingAmount || l.amount || l.totalPayable || 0).toLocaleString('en-IN');
+      const lDue = l.formattedDueDate || l.dueDate || 'scheduled date';
+      const isOverdue = l.isOverdue || (l.dueDate && new Date().toISOString().split('T')[0] > l.dueDate);
+      const ordinalTag = l.ordinalLabel ? ` (${l.ordinalLabel})` : '';
+      const overdueTag = isOverdue ? ' (Overdue)' : '';
+      return `${i + 1}) ₹${lAmt} - Due: ${lDue}${ordinalTag}${overdueTag}`;
+    }).join('\n');
+
+    const totalAmt = Number(amount || loansList.reduce((sum, l) => sum + Number(l.remainingAmount || l.amount || 0), 0)).toLocaleString('en-IN');
+    const hasAnyOverdue = loansList.some(l => l.isOverdue || (l.dueDate && new Date().toISOString().split('T')[0] > l.dueDate));
+
+    return `Hello ${name}, you have ${loansList.length} active loans with outstanding payments:
+
+${loanLines}
+
+Total Outstanding: ₹${totalAmt}.
+Please make your payments ${hasAnyOverdue ? 'as soon as possible' : 'on time'}. Thank you.`;
+  }
+
   const formattedAmount = Number(amount || 0).toLocaleString('en-IN');
   const dateStr = dueDate || 'the scheduled date';
 
@@ -44,9 +67,9 @@ function getReminderMessageText(reminderType, { clientName, amount, dueDate, day
 /**
  * Send WhatsApp Message via official Meta WhatsApp Business Cloud API
  */
-async function sendWhatsAppMessage({ to, reminderType, clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal, customMessage }) {
+async function sendWhatsAppMessage({ to, reminderType, clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal, loansList, customMessage }) {
   const normalizedPhone = normalizePhoneNumber(to);
-  const messageText = customMessage || getReminderMessageText(reminderType, { clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal });
+  const messageText = customMessage || getReminderMessageText(reminderType, { clientName, amount, dueDate, daysOverdue, overdueWeeks, overdueInterest, principal, loansList });
 
   if (!normalizedPhone) {
     return { success: false, error: 'Invalid or missing client phone number for WhatsApp message.', messageText };

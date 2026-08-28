@@ -7,7 +7,9 @@ import {
   formatDate, 
   getDurationLabel, 
   getDueStatusInfo, 
-  maskAadhaar 
+  maskAadhaar,
+  getOrdinal,
+  getLoanOrdinalLabel
 } from '../utils/formatters';
 import { generateClientTransactionsCSV } from '../utils/csvExport';
 import { 
@@ -153,7 +155,26 @@ export function ClientDetail({
     if (!loanId) return;
     setSendingReminder(true);
     try {
-      const res = await api.prepareManualReminder(loanId);
+      let customMessage = undefined;
+      if (activeLoansList.length > 1) {
+        const clientName = data?.client?.name || 'Valued Client';
+        const loanLines = activeLoansList.map((l, i) => {
+          const lAmt = formatCurrency(Number(l.remainingAmount || l.totalPayable || (Number(l.amountTaken) * 1.10)));
+          const lDue = formatDate(l.dueDate);
+          const isOverdue = l.dueDate && new Date().toISOString().split('T')[0] > l.dueDate;
+          const seq = loanRecords.length - loanRecords.findIndex(lr => lr.id === l.id);
+          const ordinalTag = seq > 0 ? ` (${getLoanOrdinalLabel(seq)})` : '';
+          const overdueTag = isOverdue ? ' (Overdue)' : '';
+          return `${i + 1}) ${lAmt} - Due: ${lDue}${ordinalTag}${overdueTag}`;
+        }).join('\n');
+
+        const totalRemAmt = formatCurrency(totalRemaining);
+        const hasAnyOverdue = activeLoansList.some(l => l.dueDate && new Date().toISOString().split('T')[0] > l.dueDate);
+
+        customMessage = `Hello ${clientName}, you have ${activeLoansList.length} active loans with outstanding payments:\n\n${loanLines}\n\nTotal Outstanding: ${totalRemAmt}.\nPlease make your payments ${hasAnyOverdue ? 'as soon as possible' : 'on time'}. Thank you.`;
+      }
+
+      const res = await api.prepareManualReminder(loanId, { customMessage });
 
       // Open delivery channel
       if (channel === 'whatsapp' && res.directWhatsAppUrl) {
@@ -162,7 +183,7 @@ export function ClientDetail({
         const recipient = res.phoneNumber || res.recipient || data?.client?.mobileNumber || '';
         const cleanDigits = String(recipient).replace(/\D/g, '');
         const phoneFormatted = cleanDigits.length === 10 ? `+91${cleanDigits}` : (cleanDigits ? `+${cleanDigits}` : '');
-        const smsUrl = `sms:${phoneFormatted}?body=${encodeURIComponent(res.messageText)}`;
+        const smsUrl = `sms:${phoneFormatted}?body=${encodeURIComponent(res.messageText || customMessage)}`;
         
         const link = document.createElement('a');
         link.href = smsUrl;
@@ -179,7 +200,7 @@ export function ClientDetail({
         channel,
         clientName: res.clientName || data?.client?.name || 'Client',
         phoneNumber: res.recipient || data?.client?.mobileNumber,
-        messageText: res.messageText,
+        messageText: res.messageText || customMessage,
         reminderType: res.reminderType
       });
 
@@ -234,13 +255,38 @@ export function ClientDetail({
     );
   }
 
+  // Helper to extract pending amount from loan record or its settlement transaction note
+  const getPendingAmountFromLoan = (l) => {
+    if (!l) return 0;
+    if (Number(l.pendingAmount) > 0) return Number(l.pendingAmount);
+    if (l.note && l.note.toLowerCase().includes('marked as pending')) {
+      const match = l.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
+      if (match && match[1]) return parseFloat(match[1]);
+    }
+    if (l.transactions && Array.isArray(l.transactions)) {
+      for (const t of l.transactions) {
+        if (t.note && t.note.toLowerCase().includes('marked as pending')) {
+          const match = t.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
+          if (match && match[1]) return parseFloat(match[1]);
+          if (t.transactionType === 'adjustment') return Number(t.amount) || 0;
+        }
+      }
+    }
+    const pPayable = Number(l.totalPayable ?? (Number(l.amountTaken || 0) * 1.10));
+    const pPaid = Number(l.totalPaid || 0);
+    if ((l.status === 'completed' || l.isSettledPending) && pPayable > pPaid) {
+      return Math.max(0, pPayable - pPaid);
+    }
+    return 0;
+  };
+
   const { client, activeLoan, activeLoans = [], loanRecords = [], reminders = [], stats } = data;
   const activeLoansList = (activeLoans && activeLoans.length > 0)
-    ? activeLoans
-    : (activeLoan && activeLoan.remainingAmount > 0 
+    ? activeLoans.filter(l => l.status !== 'completed' && !l.isSettledPending && getPendingAmountFromLoan(l) <= 0 && Number(l.remainingAmount) > 0)
+    : (activeLoan && activeLoan.remainingAmount > 0 && activeLoan.status !== 'completed' && !activeLoan.isSettledPending && getPendingAmountFromLoan(activeLoan) <= 0
         ? [activeLoan] 
-        : loanRecords.filter(l => (l.status === 'active' || l.status === 'overdue') && l.remainingAmount > 0));
-  const primaryActiveLoan = activeLoansList[0] || activeLoan || null;
+        : loanRecords.filter(l => (l.status === 'active' || l.status === 'overdue') && !l.isSettledPending && getPendingAmountFromLoan(l) <= 0 && Number(l.remainingAmount) > 0));
+  const primaryActiveLoan = activeLoansList[0] || null;
 
   // Aggregate stats across all active loans
   const totalPrincipal = activeLoansList.reduce((s, l) => s + Number(l.amountTaken || 0), 0);
@@ -248,6 +294,8 @@ export function ClientDetail({
   const totalPayable = activeLoansList.reduce((s, l) => s + Number(l.totalPayable || (l.amountTaken * 1.10)), 0);
   const totalRepaid = activeLoansList.reduce((s, l) => s + Number(l.totalPaid || 0), 0);
   const totalRemaining = activeLoansList.reduce((s, l) => s + Number(l.remainingAmount || 0), 0);
+  // Total pending money specifically marked on loan completions
+  const totalPendingMarked = (loanRecords || []).reduce((s, l) => s + getPendingAmountFromLoan(l), 0);
   const overallPct = totalPayable > 0 ? Math.min(100, Math.round((totalRepaid / totalPayable) * 100)) : 0;
 
   // Combined loan object representing all active loans for recording payments
@@ -433,7 +481,7 @@ export function ClientDetail({
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                     {activeLoansList.length > 1
                       ? `Aggregate across all ${activeLoansList.length} outstanding active loans`
-                      : `Record #${primaryActiveLoan?.id} • Issued on ${formatDate(primaryActiveLoan?.startDate)} • Due ${formatDate(primaryActiveLoan?.dueDate)}`}
+                      : `${getLoanOrdinalLabel(loanRecords.length - (primaryActiveLoan ? loanRecords.findIndex(l => l.id === primaryActiveLoan.id) : 0))} (Active) • Issued on ${formatDate(primaryActiveLoan?.startDate)} • Due ${formatDate(primaryActiveLoan?.dueDate)}`}
                   </p>
                 </div>
               </div>
@@ -453,8 +501,8 @@ export function ClientDetail({
               </div>
             </div>
 
-            {/* 4 aggregated boxes */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
+            {/* 5 aggregated boxes including Pending Amount */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
               <div className="bg-white/80 dark:bg-surface-900/80 p-4 rounded-xl border border-slate-200 dark:border-surface-800">
                 <p className="text-xs text-slate-500 dark:text-slate-400 uppercase font-semibold">Total Principal</p>
                 <p className="text-xl sm:text-2xl font-extrabold text-slate-900 dark:text-white font-mono mt-1">
@@ -482,7 +530,28 @@ export function ClientDetail({
                   {formatCurrency(totalRepaid)}
                 </p>
               </div>
+
+              <div className="bg-rose-50/80 dark:bg-rose-950/40 p-4 rounded-xl border border-rose-200 dark:border-rose-500/40">
+                <p className="text-xs text-rose-700 dark:text-rose-300 uppercase font-semibold">Pending Amount</p>
+                <p className="text-xl sm:text-2xl font-extrabold text-rose-600 dark:text-rose-400 font-mono mt-1">
+                  {formatCurrency(totalPendingMarked)}
+                </p>
+              </div>
             </div>
+
+            {/* Loan Sequence Badge Indicator */}
+            {activeLoansList.length === 1 && primaryActiveLoan && (
+              <div className="flex items-center gap-2 pt-0.5 text-xs text-slate-600 dark:text-slate-300 font-medium">
+                <span className="text-slate-400 dark:text-slate-500">Loan ID:</span>
+                <span className="px-2.5 py-0.5 rounded-md bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30 font-bold font-mono">
+                  {getLoanOrdinalLabel(loanRecords.length - loanRecords.findIndex(l => l.id === primaryActiveLoan.id))}
+                </span>
+                <span className="text-slate-400">•</span>
+                <span className="text-slate-500 dark:text-slate-400">Issued: {formatDate(primaryActiveLoan?.startDate)}</span>
+                <span className="text-slate-400">•</span>
+                <span className="text-slate-500 dark:text-slate-400">Due: {formatDate(primaryActiveLoan?.dueDate)}</span>
+              </div>
+            )}
 
             {/* Combined progress bar */}
             <div className="space-y-1.5">
@@ -566,8 +635,8 @@ export function ClientDetail({
                       {formatDate(rem.sentAt)}
                     </span>
 
-                    <span className="text-slate-400 font-mono">
-                      (Loan #{rem.loanId} • Due {formatDate(rem.dueDate)})
+                    <span className="text-slate-400 font-medium">
+                      ({loanRecords.findIndex(l => l.id === rem.loanId) !== -1 ? getLoanOrdinalLabel(loanRecords.length - loanRecords.findIndex(l => l.id === rem.loanId)) : 'Loan'} • Due {formatDate(rem.dueDate)})
                     </span>
                   </div>
 
@@ -610,9 +679,10 @@ export function ClientDetail({
         <div className="space-y-4 pt-2">
           {loanRecords.map((loan, idx) => {
             const isExpanded = expandedLoanId === loan.id;
-            const isCompleted = loan.status === 'completed';
+            const pendingAmt = getPendingAmountFromLoan(loan);
+            const isCompleted = loan.status === 'completed' || Boolean(loan.isSettledPending) || pendingAmt > 0 || Number(loan.remainingAmount) <= 0;
             const payableBase = loan.totalPayable || (loan.amountTaken * 1.10) || 1;
-            const percentPaid = payableBase > 0 ? Math.min(100, Math.round((loan.totalPaid / payableBase) * 100)) : 0;
+            const percentPaid = isCompleted ? 100 : (payableBase > 0 ? Math.min(100, Math.round((loan.totalPaid / payableBase) * 100)) : 0);
 
             return (
               <div 
@@ -625,20 +695,23 @@ export function ClientDetail({
                   className="p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3 cursor-pointer hover:bg-slate-100 dark:hover:bg-surface-800/40 transition-colors"
                 >
                   <div className="flex items-center gap-3">
-                    <span className="w-7 h-7 rounded-xl bg-slate-200 dark:bg-surface-800 text-slate-700 dark:text-slate-300 text-xs font-bold flex items-center justify-center">
+                    <span className="w-8 h-8 rounded-xl bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 text-xs font-bold flex items-center justify-center border border-purple-200 dark:border-purple-500/30 flex-shrink-0">
                       #{loanRecords.length - idx}
                     </span>
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-bold text-sm sm:text-base text-slate-900 dark:text-white">
-                          Record ID #{loan.id}
+                          {formatDate(loan.startDate)} to {formatDate(loan.dueDate)}
                         </span>
-                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30 uppercase">
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30 uppercase">
+                          {getLoanOrdinalLabel(loanRecords.length - idx)}
+                        </span>
+                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 dark:bg-surface-800 dark:text-slate-300 border border-slate-200 dark:border-surface-700 uppercase">
                           {getDurationLabel(loan.duration)}
                         </span>
                       </div>
-                      <p className="text-xs text-slate-500 mt-0.5">
-                        {formatDate(loan.startDate)} to {formatDate(loan.dueDate)}
+                      <p className="text-xs text-slate-500 mt-0.5 font-medium">
+                        {getLoanOrdinalLabel(loanRecords.length - idx)} • Issued on {formatDate(loan.startDate)}
                       </p>
                     </div>
                   </div>
@@ -646,12 +719,16 @@ export function ClientDetail({
                   <div className="flex items-center gap-2.5">
                     <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase ${
                       isCompleted 
-                        ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30' 
+                        ? (pendingAmt > 0
+                            ? 'bg-rose-50 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 border border-rose-200 dark:border-rose-500/30 font-semibold'
+                            : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30')
                         : (loan.status === 'overdue'
                             ? 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 border border-rose-200 dark:border-rose-500/40 animate-pulse'
                             : 'bg-blue-50 text-blue-700 dark:bg-blue-500/20 dark:text-blue-300 border border-blue-200 dark:border-blue-500/30')
                     }`}>
-                      {loan.status === 'overdue' && loan.daysOverdue ? `${loan.daysOverdue}d Overdue` : loan.status}
+                      {isCompleted 
+                        ? (pendingAmt > 0 ? `Completed (${formatCurrency(pendingAmt)} Pending)` : 'Completed') 
+                        : (loan.status === 'overdue' && loan.daysOverdue ? `${loan.daysOverdue}d Overdue` : loan.status)}
                     </span>
 
                     {/* Delete loan button */}
@@ -682,9 +759,9 @@ export function ClientDetail({
                   </div>
                 )}
 
-                {/* 4 Financial Stat Boxes for Loan Record */}
+                {/* 5 Financial Stat Boxes for Loan Record */}
                 <div className="px-4 sm:px-5 pb-4">
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
                     {/* Principal */}
                     <div className="bg-white dark:bg-surface-900 p-3 rounded-xl border border-slate-200 dark:border-surface-800">
                       <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-semibold">Principal</p>
@@ -716,6 +793,14 @@ export function ClientDetail({
                         {formatCurrency(loan.totalPaid)}
                       </p>
                     </div>
+
+                    {/* Pending Amount */}
+                    <div className="bg-rose-50/60 dark:bg-rose-950/30 p-3 rounded-xl border border-rose-200 dark:border-rose-500/30">
+                      <p className="text-[10px] text-rose-700 dark:text-rose-300 uppercase font-semibold">Pending Amount</p>
+                      <p className="text-base sm:text-lg font-bold text-rose-600 dark:text-rose-400 font-mono mt-0.5">
+                        {formatCurrency(pendingAmt)}
+                      </p>
+                    </div>
                   </div>
 
                   {/* Progress bar */}
@@ -727,7 +812,7 @@ export function ClientDetail({
                     <div className="w-full bg-slate-200 dark:bg-surface-900 rounded-full h-2 overflow-hidden">
                       <div
                         className={`h-full transition-all duration-300 rounded-full ${
-                          percentPaid >= 100 ? 'bg-emerald-500' : 'bg-brand-600'
+                          isCompleted || percentPaid >= 100 ? 'bg-gradient-to-r from-emerald-500 to-teal-400' : 'bg-brand-600'
                         }`}
                         style={{ width: `${percentPaid}%` }}
                       />

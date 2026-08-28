@@ -99,6 +99,37 @@ router.post('/:loanId/prepare', authMiddleware, async (req, res) => {
     const dueDateStr = loan.dueDate || '';
     const client = loan.clientId || {};
 
+    // Fetch all active loans for this client
+    const allClientActiveLoans = await Loan.find({
+      clientId: client._id,
+      status: { $in: ['active', 'overdue'] },
+      remainingAmount: { $gt: 0 },
+      isSettledPending: { $ne: true }
+    }).sort({ createdAt: 1 }).lean();
+
+    const allClientLoans = await Loan.find({ clientId: client._id }).sort({ createdAt: 1 }).lean();
+
+    let loansList = [];
+    if (allClientActiveLoans.length > 1) {
+      loansList = allClientActiveLoans.map(l => {
+        const idxInAll = allClientLoans.findIndex(al => al._id.toString() === l._id.toString());
+        const seq = idxInAll >= 0 ? idxInAll + 1 : 1;
+        const ordinal = (seq === 1 ? '1st Loan' : seq === 2 ? '2nd Loan' : seq === 3 ? '3rd Loan' : `${seq}th Loan`);
+        const formattedD = l.dueDate
+          ? new Date(l.dueDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+          : 'scheduled date';
+        return {
+          loanId: l._id.toString(),
+          remainingAmount: Number(l.remainingAmount),
+          totalPayable: Number(l.totalPayable || (l.amountTaken * 1.10)),
+          dueDate: l.dueDate,
+          formattedDueDate: formattedD,
+          ordinalLabel: ordinal,
+          isOverdue: l.dueDate && todayStr > l.dueDate
+        };
+      });
+    }
+
     let reminderType = 'manual', daysOverdue = 0, overdueWeeks = 0;
     const principal = Number(loan.amountTaken) || 0;
     const rate = Number(loan.interestRate) || 10;
@@ -119,14 +150,20 @@ router.post('/:loanId/prepare', authMiddleware, async (req, res) => {
       ? new Date(dueDateStr + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
       : 'the scheduled date';
 
+    const totalActiveAmount = allClientActiveLoans.length > 1
+      ? allClientActiveLoans.reduce((sum, l) => sum + Number(l.remainingAmount || 0), 0)
+      : loan.remainingAmount;
+
     const sendResult = await sendWhatsAppMessage({
       to: client.mobileNumber,
       reminderType,
       clientName: client.name,
-      amount: loan.remainingAmount,
+      amount: totalActiveAmount,
       totalPayable: loan.totalPayable || (principal * 1.10),
       dueDate: formattedDueDate,
-      daysOverdue, overdueWeeks, overdueInterest, principal, customMessage
+      daysOverdue, overdueWeeks, overdueInterest, principal,
+      loansList,
+      customMessage
     });
 
     const normalizedRecipient = normalizePhoneNumber(client.mobileNumber) || client.mobileNumber;
@@ -144,7 +181,8 @@ router.post('/:loanId/prepare', authMiddleware, async (req, res) => {
       directSmsUrl,
       reminderType,
       dueDate: dueDateStr,
-      amount: loan.remainingAmount
+      amount: totalActiveAmount,
+      loansCount: allClientActiveLoans.length
     });
   } catch (err) {
     console.error('Error preparing reminder:', err);
@@ -210,6 +248,37 @@ router.post('/:loanId/send', authMiddleware, async (req, res) => {
     const dueDateStr = loan.dueDate || '';
     const client = loan.clientId || {};
 
+    // Fetch all active loans for this client
+    const allClientActiveLoans = await Loan.find({
+      clientId: client._id,
+      status: { $in: ['active', 'overdue'] },
+      remainingAmount: { $gt: 0 },
+      isSettledPending: { $ne: true }
+    }).sort({ createdAt: 1 }).lean();
+
+    const allClientLoans = await Loan.find({ clientId: client._id }).sort({ createdAt: 1 }).lean();
+
+    let loansList = [];
+    if (allClientActiveLoans.length > 1) {
+      loansList = allClientActiveLoans.map(l => {
+        const idxInAll = allClientLoans.findIndex(al => al._id.toString() === l._id.toString());
+        const seq = idxInAll >= 0 ? idxInAll + 1 : 1;
+        const ordinal = (seq === 1 ? '1st Loan' : seq === 2 ? '2nd Loan' : seq === 3 ? '3rd Loan' : `${seq}th Loan`);
+        const formattedD = l.dueDate
+          ? new Date(l.dueDate + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+          : 'scheduled date';
+        return {
+          loanId: l._id.toString(),
+          remainingAmount: Number(l.remainingAmount),
+          totalPayable: Number(l.totalPayable || (l.amountTaken * 1.10)),
+          dueDate: l.dueDate,
+          formattedDueDate: formattedD,
+          ordinalLabel: ordinal,
+          isOverdue: l.dueDate && todayStr > l.dueDate
+        };
+      });
+    }
+
     let reminderType = 'manual', daysOverdue = 0, overdueWeeks = 0;
     const principal = Number(loan.amountTaken) || 0;
     const rate = Number(loan.interestRate) || 10;
@@ -230,14 +299,20 @@ router.post('/:loanId/send', authMiddleware, async (req, res) => {
       ? new Date(dueDateStr + 'T00:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
       : 'the scheduled date';
 
+    const totalActiveAmount = allClientActiveLoans.length > 1
+      ? allClientActiveLoans.reduce((sum, l) => sum + Number(l.remainingAmount || 0), 0)
+      : loan.remainingAmount;
+
     const sendResult = await sendWhatsAppMessage({
       to: client.mobileNumber,
       reminderType,
       clientName: client.name,
-      amount: loan.remainingAmount,
+      amount: totalActiveAmount,
       totalPayable: loan.totalPayable || (principal * 1.10),
       dueDate: formattedDueDate,
-      daysOverdue, overdueWeeks, overdueInterest, principal, customMessage
+      daysOverdue, overdueWeeks, overdueInterest, principal,
+      loansList,
+      customMessage
     });
 
     const normalizedRecipient = normalizePhoneNumber(client.mobileNumber) || client.mobileNumber;

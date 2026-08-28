@@ -13,6 +13,8 @@ const loanSchema = new mongoose.Schema({
   totalPaid: { type: Number, default: 0 },
   remainingAmount: { type: Number, required: true },
   status: { type: String, enum: ['active', 'completed', 'overdue'], default: 'active', index: true },
+  pendingAmount: { type: Number, default: 0 },
+  isSettledPending: { type: Boolean, default: false },
   note: { type: String, default: null }
 }, { timestamps: true });
 

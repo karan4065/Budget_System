@@ -100,10 +100,28 @@ async function syncLoanBalances(loanId) {
     // Single query for all transactions of this loan
     const transactions = await Transaction.find({ loanId }).lean();
     let totalPaid = 0, totalPenalties = 0, totalAdjustments = 0;
+    let detectedPendingAmount = Number(loan.pendingAmount) || 0;
+    let isSettledPending = Boolean(loan.isSettledPending);
+
     for (const t of transactions) {
       if (t.transactionType === 'payment') totalPaid += Number(t.amount) || 0;
       else if (t.transactionType === 'penalty') totalPenalties += Number(t.amount) || 0;
-      else if (t.transactionType === 'adjustment') totalAdjustments += Number(t.amount) || 0;
+      else if (t.transactionType === 'adjustment') {
+        totalAdjustments += Number(t.amount) || 0;
+        if (t.note && (t.note.toLowerCase().includes('marked as pending') || t.note.toLowerCase().includes('pending'))) {
+          detectedPendingAmount = Number(t.amount) || detectedPendingAmount;
+          isSettledPending = true;
+        }
+      }
+
+      // Check transaction note for pending indicator
+      if (t.note && t.note.toLowerCase().includes('marked as pending')) {
+        isSettledPending = true;
+        const match = t.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
+        if (match && match[1]) {
+          detectedPendingAmount = parseFloat(match[1]);
+        }
+      }
     }
 
     // Base interest (10% of principal)
@@ -131,7 +149,7 @@ async function syncLoanBalances(loanId) {
     let remainingAmount = Math.max(0, totalPayable - totalPaid);
 
     let status = 'active';
-    if (remainingAmount <= 0) {
+    if (remainingAmount <= 0 || isSettledPending || detectedPendingAmount > 0) {
       status = 'completed';
       remainingAmount = 0;
     } else if (isOverdue) {
@@ -143,7 +161,9 @@ async function syncLoanBalances(loanId) {
       totalPayable,
       totalPaid,
       remainingAmount,
-      status
+      status,
+      pendingAmount: detectedPendingAmount,
+      isSettledPending
     });
 
     return {
@@ -192,11 +212,27 @@ async function syncAllLoanBalances(force = false) {
     const txnMap = new Map();
     for (const t of allTxns) {
       const lid = t.loanId.toString();
-      if (!txnMap.has(lid)) txnMap.set(lid, { paid: 0, penalties: 0, adjustments: 0 });
+      if (!txnMap.has(lid)) txnMap.set(lid, { paid: 0, penalties: 0, adjustments: 0, detectedPending: 0, isSettledPending: false });
       const entry = txnMap.get(lid);
-      if (t.transactionType === 'payment') entry.paid += Number(t.amount) || 0;
-      else if (t.transactionType === 'penalty') entry.penalties += Number(t.amount) || 0;
-      else if (t.transactionType === 'adjustment') entry.adjustments += Number(t.amount) || 0;
+      if (t.transactionType === 'payment') {
+        entry.paid += Number(t.amount) || 0;
+      } else if (t.transactionType === 'penalty') {
+        entry.penalties += Number(t.amount) || 0;
+      } else if (t.transactionType === 'adjustment') {
+        entry.adjustments += Number(t.amount) || 0;
+        if (t.note && t.note.toLowerCase().includes('marked as pending')) {
+          entry.detectedPending = Number(t.amount) || entry.detectedPending;
+          entry.isSettledPending = true;
+        }
+      }
+
+      if (t.note && t.note.toLowerCase().includes('marked as pending')) {
+        entry.isSettledPending = true;
+        const match = t.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
+        if (match && match[1]) {
+          entry.detectedPending = parseFloat(match[1]);
+        }
+      }
     }
 
     const bulkOps = [];
@@ -206,7 +242,7 @@ async function syncAllLoanBalances(force = false) {
       const interestRate = Number(loan.interestRate) || 10.00;
       const baseInterest = Math.round(initialPrincipal * (interestRate / 100) * 100) / 100;
 
-      const txns = txnMap.get(lid) || { paid: 0, penalties: 0, adjustments: 0 };
+      const txns = txnMap.get(lid) || { paid: 0, penalties: 0, adjustments: 0, detectedPending: 0, isSettledPending: false };
       const dueDateStr = loan.dueDate || '';
       const isOverdue = dueDateStr && todayStr > dueDateStr;
 
@@ -222,8 +258,11 @@ async function syncAllLoanBalances(force = false) {
       const totalPayable = initialPrincipal + totalInterest + txns.penalties - txns.adjustments;
       let remainingAmount = Math.max(0, totalPayable - txns.paid);
 
+      const isSettledPending = Boolean(loan.isSettledPending) || txns.isSettledPending;
+      const pendingAmount = Number(loan.pendingAmount) || txns.detectedPending || 0;
+
       let status = 'active';
-      if (remainingAmount <= 0) {
+      if (remainingAmount <= 0 || isSettledPending || pendingAmount > 0) {
         status = 'completed';
         remainingAmount = 0;
       } else if (isOverdue) {
@@ -236,7 +275,9 @@ async function syncAllLoanBalances(force = false) {
         loan.remainingAmount !== remainingAmount ||
         loan.totalPaid !== txns.paid ||
         loan.interestAmount !== totalInterest ||
-        loan.totalPayable !== totalPayable
+        loan.totalPayable !== totalPayable ||
+        loan.pendingAmount !== pendingAmount ||
+        loan.isSettledPending !== isSettledPending
       ) {
         bulkOps.push({
           updateOne: {
@@ -247,7 +288,9 @@ async function syncAllLoanBalances(force = false) {
                 totalPayable,
                 totalPaid: txns.paid,
                 remainingAmount,
-                status
+                status,
+                pendingAmount,
+                isSettledPending
               }
             }
           }

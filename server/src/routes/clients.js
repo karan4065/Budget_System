@@ -28,6 +28,19 @@ function fmtLoan(loan, todayStr) {
   }
   const overdueInterest = overdueWeeks * baseInterest;
 
+  const totalPayable = Number(loan.totalPayable) || (principal + baseInterest);
+  const totalPaid = Number(loan.totalPaid) || 0;
+  let pendingAmount = Number(loan.pendingAmount) || 0;
+
+  // If loan is settled/completed and totalPaid is less than totalPayable, the difference is pending
+  const isSettledPending = Boolean(loan.isSettledPending) || pendingAmount > 0 || (loan.status === 'completed' && totalPaid < totalPayable);
+  if (isSettledPending && pendingAmount <= 0 && totalPaid < totalPayable) {
+    pendingAmount = Math.max(0, totalPayable - totalPaid);
+  }
+
+  const isCompleted = isSettledPending || pendingAmount > 0 || Number(loan.remainingAmount) <= 0 || loan.status === 'completed';
+  const finalStatus = isCompleted ? 'completed' : loan.status;
+
   return {
     id: loan._id.toString(),
     clientId: loan.clientId?.toString(),
@@ -38,14 +51,16 @@ function fmtLoan(loan, todayStr) {
     overdueWeeks,
     overdueInterest,
     interestAmount: Number(loan.interestAmount) || baseInterest,
-    totalPayable: Number(loan.totalPayable) || (principal + baseInterest),
+    totalPayable,
     duration: loan.duration,
     durationDays: loan.durationDays,
     startDate: loan.startDate,
     dueDate,
-    totalPaid: Number(loan.totalPaid) || 0,
-    remainingAmount: Number(loan.remainingAmount) || 0,
-    status: loan.status,
+    totalPaid,
+    remainingAmount: finalStatus === 'completed' ? 0 : (Number(loan.remainingAmount) || 0),
+    pendingAmount,
+    isSettledPending,
+    status: finalStatus,
     note: loan.note,
     createdAt: loan.createdAt,
     updatedAt: loan.updatedAt
@@ -320,13 +335,53 @@ router.get('/search/:query', authMiddleware, async (req, res) => {
     const clients = await Client.find(clientFilter).limit(25).lean();
     if (clients.length === 0) return res.json({ results: [] });
 
-    // Batch load loans for all search result clients
+    // Batch load loans and transactions for all search result clients
     const clientIds = clients.map(c => c._id);
     const allLoans = await Loan.find({ clientId: { $in: clientIds } }).sort({ createdAt: -1 }).lean();
+    const allLoanIds = allLoans.map(l => l._id);
+    const allTxns = await Transaction.find({ loanId: { $in: allLoanIds } }).sort({ transactionDate: 1 }).lean();
+
+    const txnsByLoanId = new Map();
+    for (const t of allTxns) {
+      const lid = t.loanId.toString();
+      if (!txnsByLoanId.has(lid)) txnsByLoanId.set(lid, []);
+      txnsByLoanId.get(lid).push(t);
+    }
+
     const loansByClientId = new Map();
     for (const l of allLoans) {
       const cid = l.clientId.toString();
       if (!loansByClientId.has(cid)) loansByClientId.set(cid, []);
+      
+      const txns = txnsByLoanId.get(l._id.toString()) || [];
+      let detectedPending = Number(l.pendingAmount) || 0;
+      let isSettledPending = Boolean(l.isSettledPending);
+
+      for (const t of txns) {
+        if (t.note && t.note.toLowerCase().includes('marked as pending')) {
+          isSettledPending = true;
+          const match = t.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
+          if (match && match[1]) {
+            detectedPending = parseFloat(match[1]);
+          } else if (t.transactionType === 'adjustment') {
+            detectedPending = Number(t.amount) || detectedPending;
+          }
+        }
+      }
+
+      if (isSettledPending || detectedPending > 0) {
+        l.pendingAmount = detectedPending;
+        l.isSettledPending = true;
+        l.remainingAmount = 0;
+        l.status = 'completed';
+        Loan.findByIdAndUpdate(l._id, {
+          pendingAmount: detectedPending,
+          isSettledPending: true,
+          remainingAmount: 0,
+          status: 'completed'
+        }).exec().catch(() => {});
+      }
+
       loansByClientId.get(cid).push(l);
     }
 
@@ -352,20 +407,19 @@ router.get('/search/:query', authMiddleware, async (req, res) => {
         totalAmountTaken,
         totalPaid,
         totalOutstanding,
-        records: loans.map(l => ({
-          id: l._id.toString(),
-          clientId: l.clientId.toString(),
-          amountTaken: l.amountTaken,
-          duration: l.duration,
-          durationDays: l.durationDays,
-          start_date: l.startDate,
-          due_date: l.dueDate,
-          totalPaid: l.totalPaid,
-          remainingAmount: l.remainingAmount,
-          status: l.status,
-          note: l.note,
-          createdAt: l.createdAt
-        }))
+        records: loans.map(l => {
+          const formatted = fmtLoan(l, todayStr);
+          return {
+            ...formatted,
+            amount_taken: formatted.amountTaken,
+            interest_amount: formatted.interestAmount,
+            total_payable: formatted.totalPayable,
+            total_paid: formatted.totalPaid,
+            remaining_amount: formatted.remainingAmount,
+            start_date: formatted.startDate,
+            due_date: formatted.dueDate
+          };
+        })
       });
     }
 

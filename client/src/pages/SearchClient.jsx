@@ -7,7 +7,9 @@ import {
   formatDate, 
   getDurationLabel, 
   getDueStatusInfo, 
-  maskAadhaar 
+  maskAadhaar,
+  getOrdinal,
+  getLoanOrdinalLabel
 } from '../utils/formatters';
 import { 
   Search, 
@@ -154,8 +156,14 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
           </h2>
 
           {results.map(client => {
-            const activeLoan = client.records?.find(r => r.status === 'active' || r.status === 'overdue');
-            const pastLoans = client.records?.filter(r => r.id !== activeLoan?.id) || [];
+            const activeLoans = (client.records || []).filter(r => 
+              (r.status === 'active' || r.status === 'overdue') && 
+              !r.isSettledPending && 
+              (Number(r.pendingAmount || r.pending_amount || 0) <= 0) && 
+              Number(r.remainingAmount || r.remaining_amount || 0) > 0
+            );
+            const activeLoan = activeLoans[0] || null;
+            const pastLoans = (client.records || []).filter(r => r.id !== activeLoan?.id);
 
             return (
               <div 
@@ -232,9 +240,13 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                 {activeLoan && (
                   <div className="p-4 rounded-xl bg-brand-50/50 dark:bg-surface-950/70 border border-brand-200 dark:border-brand-500/30 space-y-3">
                     <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-bold text-brand-700 dark:text-brand-300 flex items-center gap-1.5">
-                          <Clock className="w-3.5 h-3.5" /> Active Loan Record #{activeLoan.id}
+                          <Clock className="w-3.5 h-3.5" />
+                          <span>{formatDate(activeLoan.start_date || activeLoan.startDate)} to {formatDate(activeLoan.due_date || activeLoan.dueDate)}</span>
+                        </span>
+                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300 border border-purple-200 dark:border-purple-500/30">
+                          {client.records?.length ? getLoanOrdinalLabel(client.records.length - client.records.findIndex(r => r.id === activeLoan.id)) : 'Active Loan'}
                         </span>
                         <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-brand-500/15 text-brand-700 dark:text-brand-300">
                           {getDurationLabel(activeLoan.duration)}
@@ -244,10 +256,10 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                       <button
                         onClick={() => onOpenPayment({
                           id: activeLoan.id,
-                          amountTaken: activeLoan.amount_taken,
-                          totalPaid: activeLoan.total_paid,
-                          remainingAmount: activeLoan.remaining_amount,
-                          dueDate: activeLoan.due_date
+                          amountTaken: activeLoan.amountTaken ?? activeLoan.amount_taken,
+                          totalPaid: activeLoan.totalPaid ?? activeLoan.total_paid,
+                          remainingAmount: activeLoan.remainingAmount ?? activeLoan.remaining_amount,
+                          dueDate: activeLoan.dueDate ?? activeLoan.due_date
                         }, client)}
                         className="px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-sm"
                       >
@@ -255,29 +267,43 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                       </button>
                     </div>
 
-                    {/* 4 Financial Stat Boxes */}
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {/* 5 Financial Stat Boxes */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
                       <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
                         <span className="text-[10px] text-slate-500 uppercase font-semibold block">Principal</span>
-                        <span className="text-sm font-bold text-slate-900 dark:text-white font-mono">{formatCurrency(activeLoan.amount_taken)}</span>
+                        <span className="text-sm font-bold text-slate-900 dark:text-white font-mono">
+                          {formatCurrency(activeLoan.amountTaken ?? activeLoan.amount_taken ?? 0)}
+                        </span>
                       </div>
                       <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
                         <span className="text-[10px] text-slate-500 uppercase font-semibold block">Interest (10%)</span>
-                        <span className="text-sm font-bold text-amber-600 dark:text-amber-400 font-mono">+{formatCurrency(Number(activeLoan.amount_taken) * 0.10)}</span>
+                        <span className="text-sm font-bold text-amber-600 dark:text-amber-400 font-mono">
+                          +{formatCurrency(activeLoan.interestAmount ?? activeLoan.interest_amount ?? (Number(activeLoan.amountTaken ?? activeLoan.amount_taken ?? 0) * 0.10))}
+                        </span>
                       </div>
                       <div className="bg-purple-50/60 dark:bg-purple-950/30 p-2.5 rounded-lg border border-purple-200 dark:border-purple-500/30">
                         <span className="text-[10px] text-purple-700 dark:text-purple-300 uppercase font-semibold block">Total Payable</span>
-                        <span className="text-sm font-bold text-purple-700 dark:text-purple-300 font-mono">{formatCurrency(Number(activeLoan.amount_taken) * 1.10)}</span>
+                        <span className="text-sm font-bold text-purple-700 dark:text-purple-300 font-mono">
+                          {formatCurrency(activeLoan.totalPayable ?? activeLoan.total_payable ?? (Number(activeLoan.amountTaken ?? activeLoan.amount_taken ?? 0) * 1.10))}
+                        </span>
                       </div>
                       <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
                         <span className="text-[10px] text-slate-500 uppercase font-semibold block">Total Repaid</span>
-                        <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 font-mono">{formatCurrency(activeLoan.total_paid || 0)}</span>
+                        <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400 font-mono">
+                          {formatCurrency(activeLoan.totalPaid ?? activeLoan.total_paid ?? 0)}
+                        </span>
+                      </div>
+                      <div className="bg-rose-50/60 dark:bg-rose-950/30 p-2.5 rounded-lg border border-rose-200 dark:border-rose-500/30">
+                        <span className="text-[10px] text-rose-700 dark:text-rose-300 uppercase font-semibold block">Pending Amount</span>
+                        <span className="text-sm font-bold text-rose-600 dark:text-rose-400 font-mono">
+                          {formatCurrency(activeLoan.pendingAmount ?? activeLoan.pending_amount ?? 0)}
+                        </span>
                       </div>
                     </div>
 
                     <div className="flex items-center justify-between text-xs text-slate-500 pt-1">
-                      <span>Due: <strong className="text-slate-800 dark:text-slate-200">{formatDate(activeLoan.due_date)}</strong></span>
-                      <span>Remaining: <strong className="text-rose-600 dark:text-rose-400 font-mono">{formatCurrency(activeLoan.remaining_amount)}</strong></span>
+                      <span>Due: <strong className="text-slate-800 dark:text-slate-200">{formatDate(activeLoan.dueDate ?? activeLoan.due_date)}</strong></span>
+                      <span>Remaining: <strong className="text-rose-600 dark:text-rose-400 font-mono">{formatCurrency(activeLoan.remainingAmount ?? activeLoan.remaining_amount ?? 0)}</strong></span>
                     </div>
                   </div>
                 )}
@@ -291,43 +317,76 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                     </p>
 
                     <div className="space-y-2">
-                      {pastLoans.map((pLoan, i) => (
-                        <div 
-                          key={pLoan.id}
-                          className="p-3 rounded-xl bg-slate-50 dark:bg-surface-950/70 border border-slate-200 dark:border-surface-800 space-y-2 text-xs"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <span className="text-slate-400 font-mono font-bold">#{pastLoans.length - i}</span>
-                              <span className="font-bold text-slate-900 dark:text-white">Record ID #{pLoan.id}</span>
-                              <span className="text-slate-500">• {getDurationLabel(pLoan.duration)}</span>
-                              <span className="text-slate-400">({formatDate(pLoan.start_date)} to {formatDate(pLoan.due_date)})</span>
-                            </div>
-                            <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30">
-                              {pLoan.status}
-                            </span>
-                          </div>
+                      {pastLoans.map((pLoan, i) => {
+                        const loanSeq = client.records?.length ? (client.records.length - client.records.findIndex(r => r.id === pLoan.id)) : (pastLoans.length - i);
+                        const pPrincipal = Number(pLoan.amountTaken ?? pLoan.amount_taken ?? 0);
+                        const pInterest = Number(pLoan.interestAmount ?? pLoan.interest_amount ?? (pPrincipal * 0.10));
+                        const pPayable = Number(pLoan.totalPayable ?? pLoan.total_payable ?? (pPrincipal + pInterest));
+                        const pPaid = Number(pLoan.totalPaid ?? pLoan.total_paid ?? 0);
+                        let pPending = Number(pLoan.pendingAmount ?? pLoan.pending_amount ?? 0);
+                        if (pPending <= 0 && (pLoan.status === 'completed' || Boolean(pLoan.isSettledPending)) && pPayable > pPaid) {
+                          pPending = Math.max(0, pPayable - pPaid);
+                        }
+                        const isCompleted = pLoan.status === 'completed' || Boolean(pLoan.isSettledPending) || pPending > 0;
 
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
-                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
-                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Principal</span>
-                              <span className="font-mono font-bold text-slate-800 dark:text-slate-200">{formatCurrency(pLoan.amount_taken)}</span>
+                        return (
+                          <div 
+                            key={pLoan.id}
+                            className="p-3 rounded-xl bg-slate-50 dark:bg-surface-950/70 border border-slate-200 dark:border-surface-800 space-y-2 text-xs"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="w-6 h-6 rounded-lg bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 font-mono font-bold flex items-center justify-center text-[11px] border border-purple-200 dark:border-purple-500/30">
+                                  #{loanSeq}
+                                </span>
+                                <span className="font-bold text-slate-900 dark:text-white">
+                                  {formatDate(pLoan.startDate ?? pLoan.start_date)} to {formatDate(pLoan.dueDate ?? pLoan.due_date)}
+                                </span>
+                                <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 dark:bg-purple-500/20 dark:text-purple-300">
+                                  {getLoanOrdinalLabel(loanSeq)}
+                                </span>
+                                <span className="text-slate-500">• {getDurationLabel(pLoan.duration)}</span>
+                              </div>
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                isCompleted 
+                                  ? (pPending > 0
+                                      ? 'bg-rose-50 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 border border-rose-200 dark:border-rose-500/30 font-semibold'
+                                      : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/30')
+                                  : (pLoan.status === 'overdue'
+                                      ? 'bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 border border-rose-200 dark:border-rose-500/40'
+                                      : 'bg-blue-50 text-blue-700 dark:bg-blue-500/20 dark:text-blue-300 border border-blue-200 dark:border-blue-500/30')
+                              }`}>
+                                {isCompleted && pPending > 0 ? `Completed (${formatCurrency(pPending)} Pending)` : pLoan.status}
+                              </span>
                             </div>
-                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
-                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Interest (10%)</span>
-                              <span className="font-mono font-bold text-amber-600 dark:text-amber-400">+{formatCurrency(Number(pLoan.amount_taken) * 0.10)}</span>
-                            </div>
-                            <div className="bg-purple-50/50 dark:bg-purple-950/20 p-2 rounded border border-purple-200 dark:border-purple-500/20">
-                              <span className="text-[9px] text-purple-700 dark:text-purple-300 uppercase block font-medium">Total Payable</span>
-                              <span className="font-mono font-bold text-purple-700 dark:text-purple-300">{formatCurrency(Number(pLoan.amount_taken) * 1.10)}</span>
-                            </div>
-                            <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
-                              <span className="text-[9px] text-slate-400 uppercase block font-medium">Total Repaid</span>
-                              <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(pLoan.total_paid || 0)}</span>
+
+                            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-1.5">
+                              <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                                <span className="text-[9px] text-slate-400 uppercase block font-medium">Principal</span>
+                                <span className="font-mono font-bold text-slate-800 dark:text-slate-200">{formatCurrency(pPrincipal)}</span>
+                              </div>
+                              <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                                <span className="text-[9px] text-slate-400 uppercase block font-medium">Interest (10%)</span>
+                                <span className="font-mono font-bold text-amber-600 dark:text-amber-400">+{formatCurrency(pInterest)}</span>
+                              </div>
+                              <div className="bg-purple-50/50 dark:bg-purple-950/20 p-2 rounded border border-purple-200 dark:border-purple-500/20">
+                                <span className="text-[9px] text-purple-700 dark:text-purple-300 uppercase block font-medium">Total Payable</span>
+                                <span className="font-mono font-bold text-purple-700 dark:text-purple-300">{formatCurrency(pPayable)}</span>
+                              </div>
+                              <div className="bg-white dark:bg-surface-900 p-2 rounded border border-slate-200 dark:border-surface-800">
+                                <span className="text-[9px] text-slate-400 uppercase block font-medium">Total Repaid</span>
+                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(pPaid)}</span>
+                              </div>
+                              <div className="bg-rose-50/50 dark:bg-rose-950/20 p-2 rounded border border-rose-200 dark:border-rose-500/20">
+                                <span className="text-[9px] text-rose-700 dark:text-rose-300 uppercase block font-medium">Pending Amount</span>
+                                <span className="font-mono font-bold text-rose-600 dark:text-rose-400">
+                                  {formatCurrency(pPending)}
+                                </span>
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 )}

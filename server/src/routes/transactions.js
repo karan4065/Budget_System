@@ -111,100 +111,136 @@ router.get('/', authMiddleware, async (req, res) => {
 
 // POST /api/transactions - Add a transaction / payment
 router.post('/', authMiddleware, async (req, res) => {
-  const {
-    recordId,
-    amount,
-    transactionType = 'payment',
-    transactionDate = getTodayStr(),
-    paymentMode = 'Cash',
-    note,
-    isInterestRenewal = false,
-    extendDueDate = false
-  } = req.body;
+    const {
+      recordId,
+      amount,
+      transactionType = 'payment',
+      transactionDate = getTodayStr(),
+      paymentMode = 'Cash',
+      note,
+      isInterestRenewal = false,
+      extendDueDate = false,
+      markAsPendingAndComplete = false
+    } = req.body;
 
-  if (!recordId) {
-    return res.status(400).json({ error: 'Record ID is required.' });
-  }
-
-  const parsedAmount = parseFloat(amount);
-  if (isNaN(parsedAmount) || parsedAmount <= 0) {
-    return res.status(400).json({ error: 'Valid amount greater than 0 is required.' });
-  }
-
-  try {
-    if (!mongoose.Types.ObjectId.isValid(recordId)) {
-      return res.status(400).json({ error: 'Invalid loan record ID.' });
+    if (!recordId) {
+      return res.status(400).json({ error: 'Record ID is required.' });
     }
 
-    const loan = await Loan.findById(recordId);
-    if (!loan) {
-      return res.status(404).json({ error: 'Loan record not found.' });
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Valid amount greater than 0 is required.' });
     }
 
-    if (transactionType === 'payment') {
-      if (Number(loan.remainingAmount) <= 0) {
-        return res.status(400).json({ error: 'This loan record is already fully settled (Remaining: ₹0).' });
+    try {
+      if (!mongoose.Types.ObjectId.isValid(recordId)) {
+        return res.status(400).json({ error: 'Invalid loan record ID.' });
       }
-      if (parsedAmount > Number(loan.remainingAmount) && !isInterestRenewal) {
-        return res.status(400).json({
-          error: `Payment amount (₹${parsedAmount}) cannot exceed the remaining balance of ₹${Number(loan.remainingAmount)}.`
+
+      const loan = await Loan.findById(recordId);
+      if (!loan) {
+        return res.status(404).json({ error: 'Loan record not found.' });
+      }
+
+      if (transactionType === 'payment') {
+        if (Number(loan.remainingAmount) <= 0) {
+          return res.status(400).json({ error: 'This loan record is already fully settled (Remaining: ₹0).' });
+        }
+        if (parsedAmount > Number(loan.remainingAmount) && !isInterestRenewal) {
+          return res.status(400).json({
+            error: `Payment amount (₹${parsedAmount}) cannot exceed the remaining balance of ₹${Number(loan.remainingAmount)}.`
+          });
+        }
+      }
+
+      const shouldExtend = isInterestRenewal || extendDueDate || (note && note.toLowerCase().includes('interest payment'));
+      let newDueDate = loan.dueDate;
+
+      if (shouldExtend) {
+        newDueDate = calculateDueDate(loan.dueDate, loan.duration);
+        await Loan.findByIdAndUpdate(loan._id, { dueDate: newDueDate });
+      }
+
+      let projectedRemaining = Number(loan.remainingAmount);
+      if (shouldExtend) {
+        const activePrincipal = Number(loan.amountTaken);
+        const rate = Number(loan.interestRate) || 10;
+        const newCycleInterest = Math.round(activePrincipal * (rate / 100) * 100) / 100;
+        projectedRemaining = activePrincipal + newCycleInterest;
+      } else if (transactionType === 'payment' || transactionType === 'adjustment') {
+        projectedRemaining = Math.max(0, projectedRemaining - parsedAmount);
+      } else if (transactionType === 'penalty') {
+        projectedRemaining = projectedRemaining + parsedAmount;
+      }
+
+      const finalNote = note || (shouldExtend
+        ? `10% Interest Payment (Loan cycle renewed by +1 ${loan.duration || 'period'} to ${newDueDate})`
+        : (transactionType === 'payment' ? 'Repayment installment' : 'Adjustment'));
+
+      const txn = await Transaction.create({
+        loanId: loan._id,
+        clientId: loan.clientId,
+        amount: parsedAmount,
+        transactionType,
+        transactionDate,
+        remainingAfter: markAsPendingAndComplete ? 0 : projectedRemaining,
+        paymentMode,
+        note: finalNote
+      });
+
+      let pendingAmountMarked = 0;
+      if (markAsPendingAndComplete && transactionType === 'payment' && !shouldExtend && projectedRemaining > 0) {
+        pendingAmountMarked = projectedRemaining;
+        // Record adjustment transaction to clear remaining balance for loan completion
+        await Transaction.create({
+          loanId: loan._id,
+          clientId: loan.clientId,
+          amount: pendingAmountMarked,
+          transactionType: 'adjustment',
+          transactionDate,
+          remainingAfter: 0,
+          paymentMode,
+          note: `Settlement Discount / Remaining ₹${pendingAmountMarked} marked as pending (Loan completed)`
+        });
+
+        await Loan.findByIdAndUpdate(loan._id, {
+          pendingAmount: pendingAmountMarked,
+          isSettledPending: true,
+          remainingAmount: 0,
+          status: 'completed'
         });
       }
+
+      // Recalculate exact loan balance from all transactions
+      const syncResult = await syncLoanBalances(loan._id);
+
+      if (markAsPendingAndComplete && pendingAmountMarked > 0) {
+        await Loan.findByIdAndUpdate(loan._id, {
+          pendingAmount: pendingAmountMarked,
+          isSettledPending: true,
+          remainingAmount: 0,
+          status: 'completed'
+        });
+      }
+
+      return res.status(201).json({
+        message: markAsPendingAndComplete && pendingAmountMarked > 0
+          ? `Payment of ₹${parsedAmount} recorded and loan completed with ₹${pendingAmountMarked} marked as pending.`
+          : shouldExtend
+          ? `Interest payment recorded! Loan cycle renewed until ${newDueDate}.`
+          : 'Transaction recorded successfully',
+        txnId: txn._id.toString(),
+        newDueDate,
+        newTotalPaid: syncResult?.totalPaid ?? (Number(loan.totalPaid) + parsedAmount),
+        newRemaining: markAsPendingAndComplete ? 0 : (syncResult?.remainingAmount ?? projectedRemaining),
+        newStatus: markAsPendingAndComplete ? 'completed' : (syncResult?.status || evaluateStatus(projectedRemaining, newDueDate)),
+        pendingAmount: pendingAmountMarked
+      });
+    } catch (err) {
+      console.error('Error adding transaction:', err);
+      return res.status(500).json({ error: 'Failed to record transaction: ' + err.message });
     }
-
-    const shouldExtend = isInterestRenewal || extendDueDate || (note && note.toLowerCase().includes('interest payment'));
-    let newDueDate = loan.dueDate;
-
-    if (shouldExtend) {
-      newDueDate = calculateDueDate(loan.dueDate, loan.duration);
-      await Loan.findByIdAndUpdate(loan._id, { dueDate: newDueDate });
-    }
-
-    let projectedRemaining = Number(loan.remainingAmount);
-    if (shouldExtend) {
-      const activePrincipal = Number(loan.amountTaken);
-      const rate = Number(loan.interestRate) || 10;
-      const newCycleInterest = Math.round(activePrincipal * (rate / 100) * 100) / 100;
-      projectedRemaining = activePrincipal + newCycleInterest;
-    } else if (transactionType === 'payment' || transactionType === 'adjustment') {
-      projectedRemaining = Math.max(0, projectedRemaining - parsedAmount);
-    } else if (transactionType === 'penalty') {
-      projectedRemaining = projectedRemaining + parsedAmount;
-    }
-
-    const finalNote = note || (shouldExtend
-      ? `10% Interest Payment (Loan cycle renewed by +1 ${loan.duration || 'period'} to ${newDueDate})`
-      : (transactionType === 'payment' ? 'Repayment installment' : 'Adjustment'));
-
-    const txn = await Transaction.create({
-      loanId: loan._id,
-      clientId: loan.clientId,
-      amount: parsedAmount,
-      transactionType,
-      transactionDate,
-      remainingAfter: projectedRemaining,
-      paymentMode,
-      note: finalNote
-    });
-
-    // Recalculate exact loan balance from all transactions
-    const syncResult = await syncLoanBalances(loan._id);
-
-    return res.status(201).json({
-      message: shouldExtend
-        ? `Interest payment recorded! Loan cycle renewed until ${newDueDate}.`
-        : 'Transaction recorded successfully',
-      txnId: txn._id.toString(),
-      newDueDate,
-      newTotalPaid: syncResult?.totalPaid ?? (Number(loan.totalPaid) + parsedAmount),
-      newRemaining: syncResult?.remainingAmount ?? projectedRemaining,
-      newStatus: syncResult?.status || evaluateStatus(projectedRemaining, newDueDate)
-    });
-  } catch (err) {
-    console.error('Error adding transaction:', err);
-    return res.status(500).json({ error: 'Failed to record transaction: ' + err.message });
-  }
-});
+  });
 
 // PUT /api/transactions/:id - Edit an existing transaction
 router.put('/:id', authMiddleware, async (req, res) => {
