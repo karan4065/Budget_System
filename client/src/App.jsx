@@ -50,7 +50,7 @@ export default function App() {
     if (isAuthenticated) {
       fetchSidebarStats();
     }
-  }, [isAuthenticated, currentTab, refreshSignal]);
+  }, [isAuthenticated, refreshSignal]);
 
   // Global keyboard shortcut ('/' to search, 'Esc' to close)
   useEffect(() => {

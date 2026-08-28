@@ -80,12 +80,14 @@ function maskAadhaar(aadhaar) {
   return `XXXX-XXXX-${clean.slice(-4)}`;
 }
 
-// ─── Loan Balance Sync ────────────────────────────────────────────────────────
+// ─── Loan Balance Sync (High Performance & Throttled) ────────────────────────
+let lastGlobalSyncTime = 0;
+const SYNC_THROTTLE_MS = 60 * 1000; // 60 seconds throttle
 
 /**
- * Recalculate and update a loan's interest, total payable, total paid,
+ * Recalculate and update a single loan's interest, total payable, total paid,
  * remaining amount, and status based on actual transactions and current date.
- * Preserves the weekly overdue interest accrual logic.
+ * Optimized to fetch transactions in a single DB query.
  */
 async function syncLoanBalances(loanId) {
   try {
@@ -95,23 +97,23 @@ async function syncLoanBalances(loanId) {
     const initialPrincipal = Number(loan.amountTaken) || 0;
     const interestRate = Number(loan.interestRate) || 10.00;
 
-    // Fetch all transactions for this loan
-    const payments = await Transaction.find({ loanId, transactionType: 'payment' });
-    const penalties = await Transaction.find({ loanId, transactionType: 'penalty' });
-    const adjustments = await Transaction.find({ loanId, transactionType: 'adjustment' });
-
-    const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount), 0);
-    const totalPenalties = penalties.reduce((sum, p) => sum + Number(p.amount), 0);
-    const totalAdjustments = adjustments.reduce((sum, p) => sum + Number(p.amount), 0);
+    // Single query for all transactions of this loan
+    const transactions = await Transaction.find({ loanId }).lean();
+    let totalPaid = 0, totalPenalties = 0, totalAdjustments = 0;
+    for (const t of transactions) {
+      if (t.transactionType === 'payment') totalPaid += Number(t.amount) || 0;
+      else if (t.transactionType === 'penalty') totalPenalties += Number(t.amount) || 0;
+      else if (t.transactionType === 'adjustment') totalAdjustments += Number(t.amount) || 0;
+    }
 
     // Base interest (10% of principal)
     const baseInterest = Math.round(initialPrincipal * (interestRate / 100) * 100) / 100;
 
     // Date comparison (YYYY-MM-DD strings — same timezone, no UTC shift)
     const todayStr = getTodayStr();
-    const dueDateStr = loan.dueDate;   // already 'YYYY-MM-DD'
+    const dueDateStr = loan.dueDate || '';
 
-    const isOverdue = todayStr > dueDateStr;
+    const isOverdue = dueDateStr && todayStr > dueDateStr;
     let daysOverdue = 0;
     let overdueWeeks = 0;
 
@@ -125,7 +127,7 @@ async function syncLoanBalances(loanId) {
     // Overdue interest: 10% of principal per week overdue
     const overdueInterest = overdueWeeks * baseInterest;
     const totalInterest = baseInterest + overdueInterest;
-    let totalPayable = initialPrincipal + totalInterest + totalPenalties - totalAdjustments;
+    const totalPayable = initialPrincipal + totalInterest + totalPenalties - totalAdjustments;
     let remainingAmount = Math.max(0, totalPayable - totalPaid);
 
     let status = 'active';
@@ -164,24 +166,108 @@ async function syncLoanBalances(loanId) {
 }
 
 /**
- * Sync all active/overdue loans.
+ * High-performance bulk sync for all active/overdue loans.
+ * Executes in 2 queries total (instead of 5 * N queries) and writes changes in bulk.
+ * Throttled to run at most once every 60 seconds per server instance.
  */
-async function syncAllLoanBalances() {
+async function syncAllLoanBalances(force = false) {
+  const now = Date.now();
+  if (!force && (now - lastGlobalSyncTime < SYNC_THROTTLE_MS)) {
+    return;
+  }
+  lastGlobalSyncTime = now;
+
   try {
-    const loans = await Loan.find({ status: { $ne: 'completed' } }, '_id');
+    const todayStr = getTodayStr();
+    const todayDate = new Date(todayStr + 'T00:00:00');
+
+    // 1. Fetch all active/overdue loans in 1 query
+    const loans = await Loan.find({ status: { $ne: 'completed' } }).lean();
+    if (loans.length === 0) return;
+
+    const loanIds = loans.map(l => l._id);
+
+    // 2. Fetch all transactions for these loans in 1 query
+    const allTxns = await Transaction.find({ loanId: { $in: loanIds } }).lean();
+    const txnMap = new Map();
+    for (const t of allTxns) {
+      const lid = t.loanId.toString();
+      if (!txnMap.has(lid)) txnMap.set(lid, { paid: 0, penalties: 0, adjustments: 0 });
+      const entry = txnMap.get(lid);
+      if (t.transactionType === 'payment') entry.paid += Number(t.amount) || 0;
+      else if (t.transactionType === 'penalty') entry.penalties += Number(t.amount) || 0;
+      else if (t.transactionType === 'adjustment') entry.adjustments += Number(t.amount) || 0;
+    }
+
+    const bulkOps = [];
     for (const loan of loans) {
-      await syncLoanBalances(loan._id);
+      const lid = loan._id.toString();
+      const initialPrincipal = Number(loan.amountTaken) || 0;
+      const interestRate = Number(loan.interestRate) || 10.00;
+      const baseInterest = Math.round(initialPrincipal * (interestRate / 100) * 100) / 100;
+
+      const txns = txnMap.get(lid) || { paid: 0, penalties: 0, adjustments: 0 };
+      const dueDateStr = loan.dueDate || '';
+      const isOverdue = dueDateStr && todayStr > dueDateStr;
+
+      let daysOverdue = 0, overdueWeeks = 0;
+      if (isOverdue) {
+        const dueDate = new Date(dueDateStr + 'T00:00:00');
+        daysOverdue = Math.max(0, Math.floor((todayDate - dueDate) / (1000 * 60 * 60 * 24)));
+        overdueWeeks = Math.ceil(daysOverdue / 7);
+      }
+
+      const overdueInterest = overdueWeeks * baseInterest;
+      const totalInterest = baseInterest + overdueInterest;
+      const totalPayable = initialPrincipal + totalInterest + txns.penalties - txns.adjustments;
+      let remainingAmount = Math.max(0, totalPayable - txns.paid);
+
+      let status = 'active';
+      if (remainingAmount <= 0) {
+        status = 'completed';
+        remainingAmount = 0;
+      } else if (isOverdue) {
+        status = 'overdue';
+      }
+
+      // Only push update if values differ
+      if (
+        loan.status !== status ||
+        loan.remainingAmount !== remainingAmount ||
+        loan.totalPaid !== txns.paid ||
+        loan.interestAmount !== totalInterest ||
+        loan.totalPayable !== totalPayable
+      ) {
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: loan._id },
+            update: {
+              $set: {
+                interestAmount: totalInterest,
+                totalPayable,
+                totalPaid: txns.paid,
+                remainingAmount,
+                status
+              }
+            }
+          }
+        });
+      }
+    }
+
+    if (bulkOps.length > 0) {
+      await Loan.bulkWrite(bulkOps);
     }
   } catch (err) {
-    console.error('Error syncing all loan balances:', err.message);
+    console.error('Error in bulk syncing loan balances:', err.message);
   }
 }
 
 /**
  * Alias used by routes that call updateAllRecordStatuses().
  */
-async function updateAllRecordStatuses() {
-  await syncAllLoanBalances();
+async function updateAllRecordStatuses(force = false) {
+  await syncAllLoanBalances(force);
 }
 
 // ─── Admin Seeding ────────────────────────────────────────────────────────────

@@ -58,12 +58,13 @@ export function OverdueAccounts({
     try {
       setLoading(true);
       const res = await api.getClients({ duration: 'overdue' });
-      const todayStr = new Date().toISOString().split('T')[0];
-      // Strict guard: only keep clients whose due date has actually passed and still owe money
+      const now = new Date();
+      const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      // Keep loans whose status is overdue or due date has passed and still owe money
       const genuinelyOverdue = (res.clients || []).filter(c => {
         const dueDate = c.dueDate || '';
         const remaining = Number(c.remainingAmount) || 0;
-        return dueDate && dueDate < todayStr && remaining > 0;
+        return (c.status === 'overdue' || (dueDate && dueDate < todayStr)) && remaining > 0;
       });
       setClients(genuinelyOverdue);
     } catch (err) {
@@ -116,13 +117,13 @@ export function OverdueAccounts({
 
   // Filtered and sorted clients
   const filteredClients = useMemo(() => {
-    const todayStr = new Date().toISOString().split('T')[0];
+    const now = new Date();
+    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     return clients
       .filter(c => {
-        // Double-check: due date must be strictly before today and balance must be > 0
         const dueDate = c.dueDate || '';
         const remaining = Number(c.remainingAmount) || 0;
-        if (!dueDate || dueDate >= todayStr || remaining <= 0) return false;
+        if ((c.status !== 'overdue' && (!dueDate || dueDate >= todayStr)) || remaining <= 0) return false;
 
         if (durationFilter !== 'all' && (c.duration || '').toLowerCase() !== durationFilter.toLowerCase()) {
           return false;
@@ -432,7 +433,7 @@ export function OverdueAccounts({
 
                     return (
                       <tr
-                        key={client.id}
+                        key={client.latestRecordId || client.id}
                         onClick={() => onOpenClientDetail(client.id)}
                         className="hover:bg-rose-50/40 dark:hover:bg-rose-950/10 transition-colors cursor-pointer group"
                       >
@@ -574,7 +575,7 @@ export function OverdueAccounts({
 
               return (
                 <div
-                  key={client.id}
+                  key={client.latestRecordId || client.id}
                   onClick={() => onOpenClientDetail(client.id)}
                   className="bg-white dark:bg-surface-900 border border-rose-200 dark:border-rose-500/30 rounded-2xl p-4 shadow-sm hover:border-rose-400 transition-all cursor-pointer relative overflow-hidden"
                 >

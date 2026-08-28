@@ -62,12 +62,151 @@ router.get('/', authMiddleware, async (req, res) => {
 
     const isDirectoryMode = !duration || ['directory', 'all'].includes(duration.toLowerCase());
 
-    // Build client base filter (search, date range)
-    const clientFilter = {};
+    if (isDirectoryMode) {
+      // Build client base filter (search, date range)
+      const clientFilter = {};
 
-    if (startDate) clientFilter.createdAt = { ...clientFilter.createdAt, $gte: new Date(startDate) };
-    if (endDate) clientFilter.createdAt = { ...clientFilter.createdAt, $lte: new Date(endDate + 'T23:59:59') };
+      if (startDate) clientFilter.createdAt = { ...clientFilter.createdAt, $gte: new Date(startDate) };
+      if (endDate) clientFilter.createdAt = { ...clientFilter.createdAt, $lte: new Date(endDate + 'T23:59:59') };
 
+      if (search && search.trim()) {
+        const raw = search.trim();
+        const cleanDigits = raw.replace(/\D/g, '');
+        const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(raw);
+        const cleanIdCandidate = raw.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
+        const isPureDigits = /^\d+$/.test(cleanIdCandidate);
+        const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
+
+        if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
+          clientFilter.$or = [{ clientNo: parsedId }];
+        } else if (cleanDigits.length >= 7) {
+          clientFilter.mobileNumber = { $regex: cleanDigits, $options: 'i' };
+        } else {
+          clientFilter.$or = [
+            { name: { $regex: raw, $options: 'i' } },
+            { mobileNumber: { $regex: cleanDigits || raw, $options: 'i' } },
+            { aadhaarNumber: { $regex: cleanDigits || raw, $options: 'i' } }
+          ];
+        }
+      }
+
+      const clients = await Client.find(clientFilter)
+        .sort({ clientNo: 1 })
+        .skip(Number(offset))
+        .limit(Number(limit))
+        .lean();
+
+      // Batch load all loans for these clients in 1 single query
+      const clientIds = clients.map(c => c._id);
+      const allLoans = await Loan.find({ clientId: { $in: clientIds } }).sort({ createdAt: -1 }).lean();
+      const loansByClientId = new Map();
+      for (const l of allLoans) {
+        const cid = l.clientId.toString();
+        if (!loansByClientId.has(cid)) loansByClientId.set(cid, []);
+        loansByClientId.get(cid).push(l);
+      }
+
+      // Enrich each client with their loan stats
+      const formatted = [];
+      for (const client of clients) {
+        const loans = loansByClientId.get(client._id.toString()) || [];
+
+        const activeLoans = loans.filter(l => (l.status === 'active' || l.status === 'overdue') && Number(l.remainingAmount) > 0);
+        const primaryLoan = activeLoans[0] || loans[0] || {};
+
+        // Filter by status if specified in query ('active' or 'completed')
+        if (status === 'active' && activeLoans.length === 0) continue;
+        if (status === 'completed' && (loans.length === 0 || activeLoans.length > 0)) continue;
+
+        const principal = Number(primaryLoan.amountTaken) || 0;
+        const rate = Number(primaryLoan.interestRate) || 10;
+        const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
+        const dueDate = primaryLoan.dueDate || '';
+
+        let daysOverdue = 0;
+        let overdueWeeks = 0;
+        if (dueDate && todayStr > dueDate && Number(primaryLoan.remainingAmount) > 0) {
+          const d1 = new Date(dueDate + 'T00:00:00');
+          const d2 = new Date(todayStr + 'T00:00:00');
+          daysOverdue = Math.max(0, Math.floor((d2 - d1) / (1000 * 60 * 60 * 24)));
+          overdueWeeks = Math.ceil(daysOverdue / 7);
+        }
+
+        const totalGiven = loans.reduce((s, l) => s + Number(l.amountTaken || 0), 0);
+        const totalPaid = loans.reduce((s, l) => s + Number(l.totalPaid || 0), 0);
+        const totalOutstanding = loans.reduce((s, l) => s + Number(l.remainingAmount || 0), 0);
+
+        formatted.push({
+          id: client._id.toString(),
+          clientNo: client.clientNo || client._id.toString(),
+          displayId: client.clientNo || client._id.toString(),
+          name: client.name,
+          mobileNumber: client.mobileNumber,
+          aadhaarNumber: client.aadhaarNumber,
+          maskedAadhaar: maskAadhaar(client.aadhaarNumber),
+          address: client.address,
+          notes: client.notes,
+          createdAt: client.createdAt,
+          totalLoansCount: loans.length,
+          totalAmountTaken: totalGiven,
+          totalPaid: totalPaid,
+          totalAmountPaid: totalPaid,
+          totalOutstanding: totalOutstanding,
+          totalOutstandingAmount: totalOutstanding,
+          latestRecordId: primaryLoan._id ? primaryLoan._id.toString() : null,
+          amountTaken: principal,
+          interestRate: rate,
+          interestAmount: Number(primaryLoan.interestAmount) || 0,
+          totalPayable: Number(primaryLoan.totalPayable) || 0,
+          duration: primaryLoan.duration,
+          durationDays: primaryLoan.durationDays,
+          startDate: primaryLoan.startDate,
+          dueDate,
+          loanTotalPaid: Number(primaryLoan.totalPaid) || 0,
+          remainingAmount: Number(primaryLoan.remainingAmount) || 0,
+          loanStatus: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
+          status: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
+          baseInterest,
+          daysOverdue,
+          overdueWeeks,
+          overdueInterest: overdueWeeks * baseInterest
+        });
+      }
+
+      return res.json({ clients: formatted, count: formatted.length });
+    }
+
+    // Specific loan duration / status filters: overdue, due-tomorrow, weekly, fortnight, monthly, completed/history
+    const loanFilter = {};
+    const dur = duration.toLowerCase();
+
+    if (['overdue'].includes(dur)) {
+      loanFilter.$or = [{ status: 'overdue' }, { dueDate: { $lt: todayStr } }];
+      loanFilter.remainingAmount = { $gt: 0 };
+      loanFilter.status = { $ne: 'completed' };
+    } else if (['due-tomorrow', 'due_tomorrow'].includes(dur)) {
+      const tomorrow = new Date(todayStr + 'T00:00:00');
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      const y = tomorrow.getFullYear();
+      const m = String(tomorrow.getMonth() + 1).padStart(2, '0');
+      const d = String(tomorrow.getDate()).padStart(2, '0');
+      const tomorrowStr = `${y}-${m}-${d}`;
+      loanFilter.dueDate = tomorrowStr;
+      loanFilter.remainingAmount = { $gt: 0 };
+      loanFilter.status = { $ne: 'completed' };
+    } else if (['completed', 'paid', 'history'].includes(dur)) {
+      loanFilter.$or = [{ remainingAmount: 0 }, { status: 'completed' }];
+    } else if (['weekly', 'fortnight', 'monthly'].includes(dur)) {
+      loanFilter.duration = dur;
+      if (status && status !== 'all') {
+        loanFilter.status = status;
+      } else {
+        loanFilter.status = { $ne: 'completed' };
+        loanFilter.remainingAmount = { $gt: 0 };
+      }
+    }
+
+    // If client search filter applied
     if (search && search.trim()) {
       const raw = search.trim();
       const cleanDigits = raw.replace(/\D/g, '');
@@ -76,122 +215,76 @@ router.get('/', authMiddleware, async (req, res) => {
       const isPureDigits = /^\d+$/.test(cleanIdCandidate);
       const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
 
+      const clientSearchQuery = {};
       if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
-        clientFilter.$or = [{ clientNo: parsedId }];
+        clientSearchQuery.$or = [{ clientNo: parsedId }];
       } else if (cleanDigits.length >= 7) {
-        clientFilter.mobileNumber = { $regex: cleanDigits, $options: 'i' };
+        clientSearchQuery.mobileNumber = { $regex: cleanDigits, $options: 'i' };
       } else {
-        clientFilter.$or = [
+        clientSearchQuery.$or = [
           { name: { $regex: raw, $options: 'i' } },
           { mobileNumber: { $regex: cleanDigits || raw, $options: 'i' } },
           { aadhaarNumber: { $regex: cleanDigits || raw, $options: 'i' } }
         ];
       }
+      const matchedClients = await Client.find(clientSearchQuery, '_id').lean();
+      loanFilter.clientId = { $in: matchedClients.map(c => c._id) };
     }
 
-    // If specific duration filter (weekly, fortnight, monthly, due-tomorrow, overdue, completed)
-    if (!isDirectoryMode) {
-      const loanFilter = { remainingAmount: { $gte: 0 } };
-
-      if (['due-tomorrow', 'due_tomorrow'].includes(duration.toLowerCase())) {
-        const tomorrow = new Date(todayStr + 'T00:00:00');
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        const y = tomorrow.getFullYear();
-        const m = String(tomorrow.getMonth() + 1).padStart(2, '0');
-        const d = String(tomorrow.getDate()).padStart(2, '0');
-        const tomorrowStr = `${y}-${m}-${d}`;
-        loanFilter.dueDate = tomorrowStr;
-        loanFilter.remainingAmount = { $gt: 0 };
-        loanFilter.status = { $ne: 'completed' };
-      } else if (['overdue'].includes(duration.toLowerCase())) {
-        loanFilter.$or = [{ status: 'overdue' }, { dueDate: { $lt: todayStr } }];
-        loanFilter.remainingAmount = { $gt: 0 };
-        loanFilter.status = { $ne: 'completed' };
-      } else if (['completed', 'paid', 'history'].includes(duration.toLowerCase())) {
-        loanFilter.$or = [{ remainingAmount: 0 }, { status: 'completed' }];
-      } else if (['weekly', 'fortnight', 'monthly'].includes(duration.toLowerCase())) {
-        loanFilter.duration = duration.toLowerCase();
-        loanFilter.remainingAmount = { $gt: 0 };
-        loanFilter.status = { $ne: 'completed' };
-      }
-
-      const matchingLoans = await Loan.find(loanFilter, 'clientId').lean();
-      const clientIds = [...new Set(matchingLoans.map(l => l.clientId.toString()))];
-      clientFilter._id = { $in: clientIds.map(id => new mongoose.Types.ObjectId(id)) };
-    }
-
-    const clients = await Client.find(clientFilter)
-      .sort({ clientNo: 1 })
+    const loans = await Loan.find(loanFilter)
+      .populate('clientId')
+      .sort(dur === 'overdue' ? { dueDate: 1 } : { createdAt: -1 })
       .skip(Number(offset))
       .limit(Number(limit))
       .lean();
 
-    // Enrich each client with their loan stats
-    const formatted = [];
-    for (const client of clients) {
-      const loans = await Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean();
-
-      const activeLoans = loans.filter(l => (l.status === 'active' || l.status === 'overdue') && Number(l.remainingAmount) > 0);
-      const primaryLoan = activeLoans[0] || loans[0] || {};
-
-      // Filter by status if specified in query ('active' or 'completed')
-      if (status === 'active' && activeLoans.length === 0) continue;
-      if (status === 'completed' && (loans.length === 0 || activeLoans.length > 0)) continue;
-
-      const principal = Number(primaryLoan.amountTaken) || 0;
-      const rate = Number(primaryLoan.interestRate) || 10;
+    const formatted = loans.map(loan => {
+      const client = loan.clientId || {};
+      const principal = Number(loan.amountTaken) || 0;
+      const rate = Number(loan.interestRate) || 10;
       const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
-      const dueDate = primaryLoan.dueDate || '';
+      const dueDate = loan.dueDate || '';
 
       let daysOverdue = 0;
       let overdueWeeks = 0;
-      if (dueDate && todayStr > dueDate && Number(primaryLoan.remainingAmount) > 0) {
+      if (dueDate && todayStr > dueDate && Number(loan.remainingAmount) > 0) {
         const d1 = new Date(dueDate + 'T00:00:00');
         const d2 = new Date(todayStr + 'T00:00:00');
         daysOverdue = Math.max(0, Math.floor((d2 - d1) / (1000 * 60 * 60 * 24)));
         overdueWeeks = Math.ceil(daysOverdue / 7);
       }
 
-      const totalGiven = loans.reduce((s, l) => s + Number(l.amountTaken || 0), 0);
-      const totalPaid = loans.reduce((s, l) => s + Number(l.totalPaid || 0), 0);
-      const totalOutstanding = loans.reduce((s, l) => s + Number(l.remainingAmount || 0), 0);
-
-      formatted.push({
-        id: client._id.toString(),
-        clientNo: client.clientNo || client._id.toString(),
-        displayId: client.clientNo || client._id.toString(),
-        name: client.name,
-        mobileNumber: client.mobileNumber,
-        aadhaarNumber: client.aadhaarNumber,
+      return {
+        id: client._id?.toString() || loan._id.toString(),
+        clientNo: client.clientNo || client._id?.toString(),
+        displayId: client.clientNo || client._id?.toString(),
+        name: client.name || 'Unknown',
+        mobileNumber: client.mobileNumber || '',
+        aadhaarNumber: client.aadhaarNumber || '',
         maskedAadhaar: maskAadhaar(client.aadhaarNumber),
-        address: client.address,
-        notes: client.notes,
+        address: client.address || '',
+        notes: client.notes || '',
         createdAt: client.createdAt,
-        totalLoansCount: loans.length,
-        totalAmountTaken: totalGiven,
-        totalPaid: totalPaid,
-        totalAmountPaid: totalPaid,
-        totalOutstanding: totalOutstanding,
-        totalOutstandingAmount: totalOutstanding,
-        latestRecordId: primaryLoan._id ? primaryLoan._id.toString() : null,
+        latestRecordId: loan._id.toString(),
         amountTaken: principal,
         interestRate: rate,
-        interestAmount: Number(primaryLoan.interestAmount) || 0,
-        totalPayable: Number(primaryLoan.totalPayable) || 0,
-        duration: primaryLoan.duration,
-        durationDays: primaryLoan.durationDays,
-        startDate: primaryLoan.startDate,
+        interestAmount: Number(loan.interestAmount) || baseInterest,
+        totalPayable: Number(loan.totalPayable) || (principal + baseInterest),
+        duration: loan.duration,
+        durationDays: loan.durationDays,
+        startDate: loan.startDate,
         dueDate,
-        loanTotalPaid: Number(primaryLoan.totalPaid) || 0,
-        remainingAmount: Number(primaryLoan.remainingAmount) || 0,
-        loanStatus: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
-        status: primaryLoan.status || (loans.length === 0 ? 'no_loan' : 'completed'),
+        loanTotalPaid: Number(loan.totalPaid) || 0,
+        totalPaid: Number(loan.totalPaid) || 0,
+        remainingAmount: Number(loan.remainingAmount) || 0,
+        loanStatus: loan.status,
+        status: loan.status,
         baseInterest,
         daysOverdue,
         overdueWeeks,
         overdueInterest: overdueWeeks * baseInterest
-      });
-    }
+      };
+    });
 
     return res.json({ clients: formatted, count: formatted.length });
   } catch (err) {
@@ -225,10 +318,21 @@ router.get('/search/:query', authMiddleware, async (req, res) => {
     }
 
     const clients = await Client.find(clientFilter).limit(25).lean();
+    if (clients.length === 0) return res.json({ results: [] });
+
+    // Batch load loans for all search result clients
+    const clientIds = clients.map(c => c._id);
+    const allLoans = await Loan.find({ clientId: { $in: clientIds } }).sort({ createdAt: -1 }).lean();
+    const loansByClientId = new Map();
+    for (const l of allLoans) {
+      const cid = l.clientId.toString();
+      if (!loansByClientId.has(cid)) loansByClientId.set(cid, []);
+      loansByClientId.get(cid).push(l);
+    }
 
     const results = [];
     for (const c of clients) {
-      const loans = await Loan.find({ clientId: c._id }).sort({ createdAt: -1 }).lean();
+      const loans = loansByClientId.get(c._id.toString()) || [];
       const totalLoansCount = loans.length;
       const totalAmountTaken = loans.reduce((s, l) => s + (Number(l.amountTaken) || 0), 0);
       const totalPaid = loans.reduce((s, l) => s + (Number(l.totalPaid) || 0), 0);
@@ -289,14 +393,36 @@ router.get('/:id', authMiddleware, async (req, res) => {
     }
     if (!client) return res.status(404).json({ error: 'Client not found.' });
 
-    const loans = await Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean();
+    // Fetch loans, transactions, and reminders in parallel (3 fast indexed queries)
+    const [loans, allTransactions, allReminders] = await Promise.all([
+      Loan.find({ clientId: client._id }).sort({ createdAt: -1 }).lean(),
+      Transaction.find({ clientId: client._id }).sort({ transactionDate: 1, _id: 1 }).lean(),
+      Reminder.find({ clientId: client._id }).sort({ sentAt: -1 }).limit(50).lean()
+    ]);
+
+    // Group transactions and reminders by loanId in memory
+    const txnsByLoanId = new Map();
+    for (const t of allTransactions) {
+      const lid = t.loanId.toString();
+      if (!txnsByLoanId.has(lid)) txnsByLoanId.set(lid, []);
+      txnsByLoanId.get(lid).push(t);
+    }
+
+    const remindersByLoanId = new Map();
+    for (const r of allReminders) {
+      const lid = r.loanId ? r.loanId.toString() : '';
+      if (lid) {
+        if (!remindersByLoanId.has(lid)) remindersByLoanId.set(lid, []);
+        remindersByLoanId.get(lid).push(r);
+      }
+    }
 
     let lifetimeGiven = 0, lifetimeInterest = 0, lifetimeTotalPayable = 0, lifetimePaid = 0, lifetimeRemaining = 0;
     const loansWithTransactions = [];
 
     for (const loan of loans) {
-      const transactions = await Transaction.find({ loanId: loan._id }).sort({ transactionDate: 1, _id: 1 }).lean();
-      const reminders = await Reminder.find({ loanId: loan._id }).sort({ sentAt: -1 }).lean();
+      const transactions = txnsByLoanId.get(loan._id.toString()) || [];
+      const reminders = remindersByLoanId.get(loan._id.toString()) || [];
 
       const loanObj = {
         ...fmtLoan(loan, todayStr),
@@ -340,8 +466,6 @@ router.get('/:id', authMiddleware, async (req, res) => {
     const activeLoans = loansWithTransactions.filter(l => (l.status === 'active' || l.status === 'overdue') && l.remainingAmount > 0);
     const previousLoans = loansWithTransactions.filter(l => !activeLoans.find(al => al.id === l.id));
 
-    const allReminders = await Reminder.find({ clientId: client._id }).sort({ sentAt: -1 }).limit(50).lean();
-
     return res.json({
       client: {
         id: client._id.toString(),
@@ -362,8 +486,8 @@ router.get('/:id', authMiddleware, async (req, res) => {
       loanRecords: loansWithTransactions,
       reminders: allReminders.map(r => ({
         id: r._id.toString(),
-        loanId: r.loanId.toString(),
-        clientId: r.clientId.toString(),
+        loanId: r.loanId ? r.loanId.toString() : null,
+        clientId: r.clientId ? r.clientId.toString() : null,
         phoneNumber: r.phoneNumber,
         reminderType: r.reminderType,
         channel: r.channel || 'whatsapp',
