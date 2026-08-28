@@ -1,7 +1,11 @@
 import { generateClientTransactionsCSV } from './utils/csvExport';
 
 // API service for Budget Management System
-const rawApiUrl = import.meta.env.VITE_API_URL || '';
+// When running locally on localhost, use relative '/api' to communicate with local server (port 5000 via Vite proxy).
+const isLocal = typeof window !== 'undefined' && 
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+const rawApiUrl = isLocal ? '' : (import.meta.env.VITE_API_URL || '');
 const API_BASE = rawApiUrl 
   ? (rawApiUrl.endsWith('/api') ? rawApiUrl : `${rawApiUrl.replace(/\/$/, '')}/api`) 
   : '/api';

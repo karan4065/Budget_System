@@ -37,6 +37,7 @@ import {
 
 export function ClientLists({ 
   initialDuration = null, 
+  hideTabs = false,
   onOpenClientDetail, 
   onOpenAddClient, 
   onOpenPayment 
@@ -217,33 +218,34 @@ export function ClientLists({
 
   return (
     <div className="space-y-6 animate-fade-in pb-16">
-      {/* Category Tabs Switcher */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-2 border-b border-slate-200 dark:border-surface-800 scrollbar-none">
-        {[
-          { id: 'weekly', label: 'Weekly (7 Days)', icon: CalendarDays, color: 'text-blue-600 dark:text-blue-400' },
-          { id: 'fortnight', label: 'Fortnightly (14 Days)', icon: CalendarRange, color: 'text-purple-600 dark:text-purple-400' },
-          { id: 'monthly', label: 'Monthly (30 Days)', icon: Calendar, color: 'text-emerald-600 dark:text-emerald-400' },
-          { id: 'due-tomorrow', label: 'Due Tomorrow', icon: Clock, color: 'text-amber-600 dark:text-amber-400' },
-          { id: 'history', label: 'History', icon: History, color: 'text-emerald-600 dark:text-emerald-400' }
-        ].map(tab => {
-          const Icon = tab.icon;
-          const isActive = activeDuration === tab.id;
-          return (
-            <button
-              key={tab.id}
-              onClick={() => setActiveDuration(tab.id)}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-sm whitespace-nowrap transition-all ${
-                isActive
-                  ? 'bg-brand-600 text-white shadow-lg shadow-brand-600/30'
-                  : 'bg-white dark:bg-surface-900/80 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-surface-800 border border-slate-200 dark:border-surface-800'
-              }`}
-            >
-              <Icon className={`w-4 h-4 ${isActive ? 'text-white' : tab.color}`} />
-              <span>{tab.label}</span>
-            </button>
-          );
-        })}
-      </div>
+      {/* Category Tabs Switcher (Weekly / Fortnightly / Monthly / History) */}
+      {!hideTabs && activeDuration !== 'due-tomorrow' && (
+        <div className="flex items-center gap-2 overflow-x-auto pb-2 border-b border-slate-200 dark:border-surface-800 scrollbar-none">
+          {[
+            { id: 'weekly', label: 'Weekly (7 Days)', icon: CalendarDays, color: 'text-blue-600 dark:text-blue-400' },
+            { id: 'fortnight', label: 'Fortnightly (14 Days)', icon: CalendarRange, color: 'text-purple-600 dark:text-purple-400' },
+            { id: 'monthly', label: 'Monthly (30 Days)', icon: Calendar, color: 'text-emerald-600 dark:text-emerald-400' },
+            { id: 'history', label: 'History', icon: History, color: 'text-emerald-600 dark:text-emerald-400' }
+          ].map(tab => {
+            const Icon = tab.icon;
+            const isActive = activeDuration === tab.id;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActiveDuration(tab.id)}
+                className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-sm whitespace-nowrap transition-all ${
+                  isActive
+                    ? 'bg-brand-600 text-white shadow-lg shadow-brand-600/30'
+                    : 'bg-white dark:bg-surface-900/80 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-surface-800 border border-slate-200 dark:border-surface-800'
+                }`}
+              >
+                <Icon className={`w-4 h-4 ${isActive ? 'text-white' : tab.color}`} />
+                <span>{tab.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* Page Title & Search Header */}
       <div className="glass-card rounded-2xl p-5 border border-slate-200 dark:border-surface-700/60 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-4">

@@ -81,7 +81,13 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                 autoFocus
                 placeholder="Enter Client ID (e.g. 1), Name, Mobile, or Aadhaar..."
                 value={query}
-                onChange={(e) => setQuery(e.target.value)}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  if (!e.target.value.trim()) {
+                    setResults(null);
+                    setHasSearched(false);
+                  }
+                }}
                 className="w-full pl-12 pr-4 py-3.5 rounded-xl bg-slate-50 dark:bg-surface-950 border border-slate-200 dark:border-surface-700 text-slate-900 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 text-base font-medium shadow-inner transition-all"
               />
             </div>

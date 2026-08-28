@@ -12,7 +12,7 @@ const Transaction = require('../models/Transaction');
 const Reminder = require('../models/Reminder');
 
 // ─── Helper: format loan for response ────────────────────────────────────────
-function fmtLoan(loan, todayStr) {
+function fmtLoan(loan, todayStr = getTodayStr()) {
   const principal = Number(loan.amountTaken) || 0;
   const rate = Number(loan.interestRate) || 10.00;
   const baseInterest = Math.round(principal * (rate / 100) * 100) / 100;
@@ -67,6 +67,54 @@ function fmtLoan(loan, todayStr) {
   };
 }
 
+// ─── Helper: unified client search filter builder ───────────────────────────
+function buildClientSearchFilter(searchStr) {
+  if (!searchStr || typeof searchStr !== 'string' || !searchStr.trim()) return null;
+
+  const raw = searchStr.trim();
+  const cleanDigits = raw.replace(/\D/g, '');
+  const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(raw);
+  const cleanIdCandidate = raw.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
+  const isPureDigits = /^\d+$/.test(cleanIdCandidate);
+  const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
+
+  // If explicitly searching like "#1" or "id: 1"
+  if (isExplicitId && parsedId !== null) {
+    return { clientNo: parsedId };
+  }
+
+  const orConditions = [];
+
+  // 1. Client ID match (by numeric sequential clientNo, e.g. 1, 2, 100)
+  if (parsedId !== null && cleanIdCandidate.length <= 6) {
+    orConditions.push({ clientNo: parsedId });
+  }
+
+  // 2. MongoDB ObjectId match (24 hex characters)
+  if (mongoose.Types.ObjectId.isValid(raw) && raw.length === 24) {
+    orConditions.push({ _id: new mongoose.Types.ObjectId(raw) });
+  }
+
+  // 3. Client Name match (case-insensitive substring)
+  orConditions.push({ name: { $regex: escaped, $options: 'i' } });
+
+  // 4. Mobile Number match
+  if (cleanDigits.length >= 3) {
+    orConditions.push({ mobileNumber: { $regex: cleanDigits, $options: 'i' } });
+  } else if (!isPureDigits) {
+    orConditions.push({ mobileNumber: { $regex: escaped, $options: 'i' } });
+  }
+
+  // 5. Aadhaar Number match
+  if (cleanDigits.length >= 3) {
+    orConditions.push({ aadhaarNumber: { $regex: cleanDigits, $options: 'i' } });
+  }
+
+  return orConditions.length > 0 ? { $or: orConditions } : null;
+}
+
 // ─── GET /api/clients ─────────────────────────────────────────────────────────
 router.get('/', authMiddleware, async (req, res) => {
   try {
@@ -85,23 +133,9 @@ router.get('/', authMiddleware, async (req, res) => {
       if (endDate) clientFilter.createdAt = { ...clientFilter.createdAt, $lte: new Date(endDate + 'T23:59:59') };
 
       if (search && search.trim()) {
-        const raw = search.trim();
-        const cleanDigits = raw.replace(/\D/g, '');
-        const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(raw);
-        const cleanIdCandidate = raw.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
-        const isPureDigits = /^\d+$/.test(cleanIdCandidate);
-        const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
-
-        if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
-          clientFilter.$or = [{ clientNo: parsedId }];
-        } else if (cleanDigits.length >= 7) {
-          clientFilter.mobileNumber = { $regex: cleanDigits, $options: 'i' };
-        } else {
-          clientFilter.$or = [
-            { name: { $regex: raw, $options: 'i' } },
-            { mobileNumber: { $regex: cleanDigits || raw, $options: 'i' } },
-            { aadhaarNumber: { $regex: cleanDigits || raw, $options: 'i' } }
-          ];
+        const sf = buildClientSearchFilter(search);
+        if (sf) {
+          Object.assign(clientFilter, sf);
         }
       }
 
@@ -223,27 +257,11 @@ router.get('/', authMiddleware, async (req, res) => {
 
     // If client search filter applied
     if (search && search.trim()) {
-      const raw = search.trim();
-      const cleanDigits = raw.replace(/\D/g, '');
-      const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(raw);
-      const cleanIdCandidate = raw.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
-      const isPureDigits = /^\d+$/.test(cleanIdCandidate);
-      const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
-
-      const clientSearchQuery = {};
-      if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
-        clientSearchQuery.$or = [{ clientNo: parsedId }];
-      } else if (cleanDigits.length >= 7) {
-        clientSearchQuery.mobileNumber = { $regex: cleanDigits, $options: 'i' };
-      } else {
-        clientSearchQuery.$or = [
-          { name: { $regex: raw, $options: 'i' } },
-          { mobileNumber: { $regex: cleanDigits || raw, $options: 'i' } },
-          { aadhaarNumber: { $regex: cleanDigits || raw, $options: 'i' } }
-        ];
+      const sf = buildClientSearchFilter(search);
+      if (sf) {
+        const matchedClients = await Client.find(sf, '_id').lean();
+        loanFilter.clientId = { $in: matchedClients.map(c => c._id) };
       }
-      const matchedClients = await Client.find(clientSearchQuery, '_id').lean();
-      loanFilter.clientId = { $in: matchedClients.map(c => c._id) };
     }
 
     const loans = await Loan.find(loanFilter)
@@ -312,28 +330,24 @@ router.get('/', authMiddleware, async (req, res) => {
 router.get('/search/:query', authMiddleware, async (req, res) => {
   try {
     await updateAllRecordStatuses();
-    const rawQuery = req.params.query.trim();
-    const cleanDigits = rawQuery.replace(/\D/g, '');
-    const isExplicitId = /^#|^id\s*:?\s*|^client\s*:?\s*/i.test(rawQuery);
-    const cleanIdCandidate = rawQuery.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
-    const isPureDigits = /^\d+$/.test(cleanIdCandidate);
-    const parsedId = isPureDigits ? parseInt(cleanIdCandidate, 10) : null;
+    const todayStr = getTodayStr();
+    const rawQuery = req.params.query ? req.params.query.trim() : '';
+    if (!rawQuery) return res.json({ results: [] });
 
-    let clientFilter = {};
-    if ((isExplicitId || isPureDigits) && parsedId !== null && cleanIdCandidate.length <= 5) {
-      clientFilter = { clientNo: parsedId };
-    } else if (cleanDigits.length >= 7) {
-      clientFilter = { $or: [{ mobileNumber: { $regex: cleanDigits, $options: 'i' } }, { aadhaarNumber: { $regex: cleanDigits, $options: 'i' } }] };
-    } else {
-      clientFilter = { $or: [
-        { name: { $regex: rawQuery, $options: 'i' } },
-        { mobileNumber: { $regex: cleanDigits || rawQuery, $options: 'i' } },
-        { aadhaarNumber: { $regex: cleanDigits || rawQuery, $options: 'i' } }
-      ]};
-    }
-
+    const clientFilter = buildClientSearchFilter(rawQuery) || {};
     const clients = await Client.find(clientFilter).limit(25).lean();
     if (clients.length === 0) return res.json({ results: [] });
+
+    // Prioritize exact clientNo match if query has digits
+    const cleanIdCandidate = rawQuery.replace(/^#|^id\s*:?\s*|^client\s*:?\s*/i, '').trim();
+    const parsedId = /^\d+$/.test(cleanIdCandidate) ? parseInt(cleanIdCandidate, 10) : null;
+    if (parsedId !== null) {
+      clients.sort((a, b) => {
+        if (a.clientNo === parsedId && b.clientNo !== parsedId) return -1;
+        if (b.clientNo === parsedId && a.clientNo !== parsedId) return 1;
+        return (a.clientNo || 999999) - (b.clientNo || 999999);
+      });
+    }
 
     // Batch load loans and transactions for all search result clients
     const clientIds = clients.map(c => c._id);

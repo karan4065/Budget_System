@@ -24,16 +24,6 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       badge: null
     },
     {
-      section: 'Reminders & Schedules'
-    },
-    {
-      id: 'due-tomorrow',
-      label: 'History',
-      icon: Clock,
-      badge: stats?.dueTomorrowCount || null,
-      badgeColor: 'bg-slate-100 text-slate-700 dark:bg-surface-800 dark:text-slate-300 border-slate-300 dark:border-surface-700'
-    },
-    {
       section: 'Overdue & Collections'
     },
     {
@@ -42,6 +32,22 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       icon: AlertOctagon,
       badge: stats?.overdueRecordsCount || null,
       badgeColor: 'bg-rose-500/10 text-rose-600 dark:bg-rose-500/20 dark:text-rose-300 border-rose-500/30 animate-pulse'
+    },
+    {
+      id: 'due-tomorrow',
+      label: 'Due Tomorrow',
+      icon: Clock,
+      badge: stats?.dueTomorrowCount || null,
+      badgeColor: 'bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300 border-amber-500/30 font-semibold'
+    },
+    {
+      section: 'Reminders & Schedules'
+    },
+    {
+      id: 'history',
+      label: 'Loan History',
+      icon: History,
+      badge: null
     },
     {
       section: 'Records & Auditing'
@@ -55,7 +61,7 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
     },
     {
       id: 'search',
-      label: 'Search Mobile',
+      label: 'Search Client',
       icon: Search
     },
     {

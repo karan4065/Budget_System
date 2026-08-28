@@ -191,6 +191,7 @@ export default function App() {
           {currentTab === 'due-tomorrow' && (
             <ClientLists
               initialDuration="due-tomorrow"
+              hideTabs={true}
               onOpenClientDetail={handleOpenClientDetail}
               onOpenAddClient={() => setIsAddClientOpen(true)}
               onOpenPayment={handleOpenPayment}
