@@ -28,18 +28,40 @@ function fmtLoan(loan, todayStr = getTodayStr()) {
   }
   const overdueInterest = overdueWeeks * baseInterest;
 
-  const totalPayable = Number(loan.totalPayable) || (principal + baseInterest);
+  const totalPayable = Math.max(principal + baseInterest, Number(loan.totalPayable) || 0);
   const totalPaid = Number(loan.totalPaid) || 0;
-  let pendingAmount = Number(loan.pendingAmount) || 0;
 
-  // If loan is settled/completed and totalPaid is less than totalPayable, the difference is pending
-  const isSettledPending = Boolean(loan.isSettledPending) || pendingAmount > 0 || (loan.status === 'completed' && totalPaid < totalPayable);
-  if (isSettledPending && pendingAmount <= 0 && totalPaid < totalPayable) {
+  // Single source of truth for Status & Pending Amount
+  let pendingAmount = 0;
+  let isSettledPending = Boolean(loan.isSettledPending);
+  let finalStatus = 'active';
+  let remainingAmount = 0;
+
+  if (totalPaid >= totalPayable) {
+    // Case 1: Fully paid! Pending amount is EXACTLY 0 everywhere
+    finalStatus = 'completed';
+    remainingAmount = 0;
+    pendingAmount = 0;
+    isSettledPending = false;
+  } else if (isSettledPending || loan.status === 'completed') {
+    // Case 2: Completed with partial payment! Preserves exact unpaid balance as pending
+    finalStatus = 'completed';
+    remainingAmount = 0;
     pendingAmount = Math.max(0, totalPayable - totalPaid);
+    isSettledPending = pendingAmount > 0;
+  } else if (daysOverdue > 0) {
+    // Case 3: Active overdue loan
+    finalStatus = 'overdue';
+    remainingAmount = Math.max(0, totalPayable - totalPaid);
+    pendingAmount = 0;
+    isSettledPending = false;
+  } else {
+    // Case 4: Active on-time loan
+    finalStatus = 'active';
+    remainingAmount = Math.max(0, totalPayable - totalPaid);
+    pendingAmount = 0;
+    isSettledPending = false;
   }
-
-  const isCompleted = isSettledPending || pendingAmount > 0 || Number(loan.remainingAmount) <= 0 || loan.status === 'completed';
-  const finalStatus = isCompleted ? 'completed' : loan.status;
 
   return {
     id: loan._id.toString(),
@@ -315,7 +337,9 @@ router.get('/', authMiddleware, async (req, res) => {
         baseInterest,
         daysOverdue,
         overdueWeeks,
-        overdueInterest: overdueWeeks * baseInterest
+        overdueInterest: overdueWeeks * baseInterest,
+        pendingAmount: Number(loan.pendingAmount) || 0,
+        isSettledPending: Boolean(loan.isSettledPending)
       };
     });
 
@@ -441,6 +465,200 @@ router.get('/search/:query', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Search error:', err);
     return res.status(500).json({ error: 'Search failed: ' + err.message });
+  }
+});
+
+// ─── GET /api/clients/pending ────────────────────────────────────────────────
+router.get('/pending', authMiddleware, async (req, res) => {
+  try {
+    await updateAllRecordStatuses();
+    const { search } = req.query;
+
+    // Find all loans with pending amount
+    const pendingLoans = await Loan.find({ pendingAmount: { $gt: 0 } })
+      .populate('clientId')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Group loans by client
+    const clientMap = new Map();
+    for (const loan of pendingLoans) {
+      if (!loan.clientId) continue;
+      const cid = loan.clientId._id.toString();
+      if (!clientMap.has(cid)) {
+        clientMap.set(cid, {
+          client: loan.clientId,
+          loans: [],
+          totalPendingAmount: 0
+        });
+      }
+      const entry = clientMap.get(cid);
+      const pAmt = Number(loan.pendingAmount) || 0;
+      entry.loans.push({
+        id: loan._id.toString(),
+        amountTaken: Number(loan.amountTaken) || 0,
+        totalPayable: Number(loan.totalPayable) || 0,
+        totalPaid: Number(loan.totalPaid) || 0,
+        pendingAmount: pAmt,
+        duration: loan.duration,
+        startDate: loan.startDate,
+        dueDate: loan.dueDate,
+        status: loan.status,
+        note: loan.note
+      });
+      entry.totalPendingAmount += pAmt;
+    }
+
+    let clientsList = [];
+    for (const [cid, data] of clientMap.entries()) {
+      const c = data.client;
+      clientsList.push({
+        id: c._id.toString(),
+        clientNo: c.clientNo,
+        displayId: c.clientNo,
+        name: c.name,
+        mobileNumber: c.mobileNumber,
+        aadhaarNumber: c.aadhaarNumber,
+        maskedAadhaar: maskAadhaar(c.aadhaarNumber),
+        address: c.address,
+        totalPendingAmount: data.totalPendingAmount,
+        pendingLoansCount: data.loans.length,
+        loans: data.loans
+      });
+    }
+
+    // Apply optional client search filter if provided
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      const cleanDigits = q.replace(/\D/g, '');
+      clientsList = clientsList.filter(c => {
+        const matchesName = c.name && c.name.toLowerCase().includes(q);
+        const matchesId = String(c.clientNo) === q || String(c.clientNo) === cleanDigits;
+        const matchesPhone = cleanDigits && c.mobileNumber && c.mobileNumber.includes(cleanDigits);
+        const matchesAadhaar = cleanDigits && c.aadhaarNumber && c.aadhaarNumber.includes(cleanDigits);
+        return matchesName || matchesId || matchesPhone || matchesAadhaar;
+      });
+    }
+
+    // Sort: highest pending amount first, then by clientNo
+    clientsList.sort((a, b) => b.totalPendingAmount - a.totalPendingAmount || (a.clientNo || 0) - (b.clientNo || 0));
+
+    const grandTotalPending = clientsList.reduce((sum, c) => sum + c.totalPendingAmount, 0);
+
+    return res.json({
+      clients: clientsList,
+      totalPendingClients: clientsList.length,
+      totalPendingAmount: grandTotalPending
+    });
+  } catch (err) {
+    console.error('Fetch pending clients error:', err);
+    return res.status(500).json({ error: 'Failed to fetch pending clients: ' + err.message });
+  }
+});
+
+// ─── POST /api/clients/clear-pending ─────────────────────────────────────────
+router.post('/clear-pending', authMiddleware, async (req, res) => {
+  try {
+    const { clientId, loanId, amount, paymentMode = 'Cash', note } = req.body;
+
+    if (!clientId) {
+      return res.status(400).json({ error: 'Client ID is required.' });
+    }
+
+    const client = await Client.findById(clientId);
+    if (!client) {
+      return res.status(404).json({ error: 'Client not found.' });
+    }
+
+    let loansToProcess = [];
+    if (loanId) {
+      const loan = await Loan.findOne({ _id: loanId, clientId: client._id });
+      if (!loan) return res.status(404).json({ error: 'Loan record not found for this client.' });
+      if ((Number(loan.pendingAmount) || 0) <= 0) {
+        return res.status(400).json({ error: 'This loan does not have any pending amount.' });
+      }
+      loansToProcess.push(loan);
+    } else {
+      // Find all loans of this client with pending amount > 0, oldest first
+      loansToProcess = await Loan.find({ clientId: client._id, pendingAmount: { $gt: 0 } }).sort({ createdAt: 1 });
+      if (loansToProcess.length === 0) {
+        return res.status(400).json({ error: 'This client has no pending dues.' });
+      }
+    }
+
+    const totalAvailablePending = loansToProcess.reduce((s, l) => s + (Number(l.pendingAmount) || 0), 0);
+    const paymentAmount = (amount !== undefined && amount !== null && Number(amount) > 0)
+      ? Math.min(Number(amount), totalAvailablePending)
+      : totalAvailablePending;
+
+    if (paymentAmount <= 0) {
+      return res.status(400).json({ error: 'Payment amount must be greater than 0.' });
+    }
+
+    let remainingToDeduct = paymentAmount;
+    const todayStr = getTodayStr();
+    const processedLoans = [];
+
+    for (const loan of loansToProcess) {
+      if (remainingToDeduct <= 0) break;
+
+      const currentPending = Number(loan.pendingAmount) || 0;
+      const deductFromThisLoan = Math.min(currentPending, remainingToDeduct);
+
+      if (deductFromThisLoan > 0) {
+        const newPending = currentPending - deductFromThisLoan;
+        remainingToDeduct -= deductFromThisLoan;
+
+        // 1. Record payment transaction
+        await Transaction.create({
+          loanId: loan._id,
+          clientId: client._id,
+          amount: deductFromThisLoan,
+          transactionType: 'payment',
+          transactionDate: todayStr,
+          remainingAfter: 0,
+          paymentMode: paymentMode || 'Cash',
+          note: note || (newPending === 0
+            ? `Pending dues of ₹${deductFromThisLoan} fully cleared`
+            : `Partial payment of ₹${deductFromThisLoan} towards pending balance`)
+        });
+
+        // 2. Update loan record
+        loan.pendingAmount = newPending;
+        loan.totalPaid = (Number(loan.totalPaid) || 0) + deductFromThisLoan;
+        if (newPending === 0) {
+          loan.isSettledPending = false;
+        }
+        await loan.save();
+
+        // 3. Sync balances
+        await syncLoanBalances(loan._id);
+        processedLoans.push({
+          loanId: loan._id.toString(),
+          clearedAmount: deductFromThisLoan,
+          remainingPending: newPending
+        });
+      }
+    }
+
+    // Return updated pending sum for this client
+    const updatedPendingLoans = await Loan.find({ clientId: client._id, pendingAmount: { $gt: 0 } }).lean();
+    const remainingClientPending = updatedPendingLoans.reduce((s, l) => s + (Number(l.pendingAmount) || 0), 0);
+
+    return res.json({
+      message: `Successfully cleared ₹${paymentAmount} pending dues for ${client.name}.`,
+      clearedAmount: paymentAmount,
+      remainingPending: remainingClientPending,
+      processedLoans,
+      client: {
+        id: client._id.toString(),
+        name: client.name,
+        totalPendingAmount: remainingClientPending
+      }
+    });
+  } catch (err) {
+    console.error('Clear pending error:', err);
+    return res.status(500).json({ error: 'Failed to clear pending dues: ' + err.message });
   }
 });
 

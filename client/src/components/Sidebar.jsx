@@ -12,7 +12,8 @@ import {
   Clock, 
   Shield, 
   HelpCircle,
-  CheckCircle2
+  CheckCircle2,
+  Coins
 } from 'lucide-react';
 
 export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, stats }) {
@@ -48,6 +49,13 @@ export function Sidebar({ currentTab, onNavigate, isMobileOpen, onCloseMobile, s
       label: 'Loan History',
       icon: History,
       badge: null
+    },
+    {
+      id: 'pending-list',
+      label: 'Pending List',
+      icon: Coins,
+      badge: stats?.pendingClientsCount || null,
+      badgeColor: 'bg-rose-500/15 text-rose-700 dark:bg-rose-500/20 dark:text-rose-300 border-rose-500/30 font-bold'
     },
     {
       section: 'Records & Auditing'

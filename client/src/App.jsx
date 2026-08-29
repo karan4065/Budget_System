@@ -13,6 +13,7 @@ import { SearchClient } from './pages/SearchClient';
 import { TransactionsPage } from './pages/TransactionsPage';
 import { AllClients } from './pages/AllClients';
 import { OverdueAccounts } from './pages/OverdueAccounts';
+import { PendingList } from './pages/PendingList';
 import { AddClientModal } from './components/AddClientModal';
 import { AddPaymentModal } from './components/AddPaymentModal';
 import { NewLoanModal } from './components/NewLoanModal';
@@ -212,6 +213,13 @@ export default function App() {
               onOpenClientDetail={handleOpenClientDetail}
               onOpenAddClient={() => setIsAddClientOpen(true)}
               onOpenPayment={handleOpenPayment}
+            />
+          )}
+
+          {currentTab === 'pending-list' && (
+            <PendingList
+              onOpenClientDetail={handleOpenClientDetail}
+              onOpenNewLoan={handleOpenNewLoan}
             />
           )}
 

@@ -239,22 +239,6 @@ export function AddPaymentModal({ isOpen, onClose, loanRecord, client, onSuccess
           markAsPendingAndComplete: markAsPendingAndComplete
         });
 
-        // When marking remaining as pending and completing loan, create the adjustment transaction to balance out remaining amount
-        if (markAsPendingAndComplete && pendingDiff > 0 && formData.transactionType === 'payment' && !formData.isInterestRenewal) {
-          try {
-            await api.createTransaction({
-              recordId: loanRecord.id,
-              amount: pendingDiff,
-              transactionType: 'adjustment',
-              transactionDate: formData.transactionDate,
-              paymentMode: formData.paymentMode,
-              note: `Settlement Discount / Remaining ₹${pendingDiff} marked as pending (Loan completed)`
-            });
-          } catch (adjErr) {
-            console.warn('Note: Adjustment transaction sync:', adjErr.message);
-          }
-        }
-
         if (markAsPendingAndComplete) {
           success(`Payment of ${formatCurrency(parsedEnteredAmount)} recorded! Loan completed with ${formatCurrency(pendingDiff)} marked as pending.`);
         } else if (formData.isInterestRenewal) {

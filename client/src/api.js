@@ -87,6 +87,16 @@ export const api = {
     method: 'DELETE'
   }),
   searchClients: (query) => request(`/clients/search/${encodeURIComponent(query)}`),
+  getPendingClients: (search = '') => {
+    const query = new URLSearchParams();
+    if (search && search.trim()) query.set('search', search.trim());
+    const qs = query.toString();
+    return request(`/clients/pending${qs ? `?${qs}` : ''}`);
+  },
+  clearPendingAmount: (data) => request('/clients/clear-pending', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
   downloadClientCSV: async (clientId) => {
     const clientData = await api.getClient(clientId);
     if (!clientData || !clientData.client) {

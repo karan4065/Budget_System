@@ -255,26 +255,22 @@ export function ClientDetail({
     );
   }
 
-  // Helper to extract pending amount from loan record or its settlement transaction note
+  // Single source of truth helper for loan pending amount
   const getPendingAmountFromLoan = (l) => {
     if (!l) return 0;
-    if (Number(l.pendingAmount) > 0) return Number(l.pendingAmount);
-    if (l.note && l.note.toLowerCase().includes('marked as pending')) {
-      const match = l.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
-      if (match && match[1]) return parseFloat(match[1]);
-    }
-    if (l.transactions && Array.isArray(l.transactions)) {
-      for (const t of l.transactions) {
-        if (t.note && t.note.toLowerCase().includes('marked as pending')) {
-          const match = t.note.match(/Remaining\s*₹?\s*(\d+(?:\.\d+)?)\s*marked as pending/i);
-          if (match && match[1]) return parseFloat(match[1]);
-          if (t.transactionType === 'adjustment') return Number(t.amount) || 0;
-        }
-      }
-    }
-    const pPayable = Number(l.totalPayable ?? (Number(l.amountTaken || 0) * 1.10));
-    const pPaid = Number(l.totalPaid || 0);
-    if ((l.status === 'completed' || l.isSettledPending) && pPayable > pPaid) {
+    const pPrincipal = Number(l.amountTaken ?? l.amount_taken ?? 0);
+    const pPayable = Math.max(Number(l.totalPayable ?? l.total_payable ?? 0), pPrincipal * 1.10);
+    const pPaid = Number(l.totalPaid ?? l.total_paid ?? 0);
+
+    // If fully paid, pending is strictly 0 everywhere
+    if (pPaid >= pPayable && pPayable > 0) return 0;
+
+    // Use backend pendingAmount if present
+    const pPending = Number(l.pendingAmount ?? l.pending_amount ?? 0);
+    if (pPending > 0) return pPending;
+
+    // Fallback if marked as completed with partial payment
+    if ((l.status === 'completed' || Boolean(l.isSettledPending)) && pPayable > pPaid) {
       return Math.max(0, pPayable - pPaid);
     }
     return 0;
@@ -681,8 +677,8 @@ export function ClientDetail({
             const isExpanded = expandedLoanId === loan.id;
             const pendingAmt = getPendingAmountFromLoan(loan);
             const isCompleted = loan.status === 'completed' || Boolean(loan.isSettledPending) || pendingAmt > 0 || Number(loan.remainingAmount) <= 0;
-            const payableBase = loan.totalPayable || (loan.amountTaken * 1.10) || 1;
-            const percentPaid = isCompleted ? 100 : (payableBase > 0 ? Math.min(100, Math.round((loan.totalPaid / payableBase) * 100)) : 0);
+            const payableBase = Math.max(Number(loan.totalPayable) || 0, Number(loan.amountTaken || 0) * 1.10);
+            const percentPaid = (pendingAmt <= 0 && isCompleted) ? 100 : (payableBase > 0 ? Math.min(100, Math.round((loan.totalPaid / payableBase) * 100)) : 0);
 
             return (
               <div 
@@ -782,7 +778,7 @@ export function ClientDetail({
                     <div className="bg-purple-50/60 dark:bg-purple-950/30 p-3 rounded-xl border border-purple-200 dark:border-purple-500/30">
                       <p className="text-[10px] text-purple-700 dark:text-purple-300 uppercase font-semibold">Total Payable</p>
                       <p className="text-base sm:text-lg font-bold text-purple-700 dark:text-purple-300 font-mono mt-0.5">
-                        {formatCurrency(loan.totalPayable || (loan.amountTaken * 1.10))}
+                        {formatCurrency(Math.max(Number(loan.totalPayable) || 0, Number(loan.amountTaken || 0) * 1.10))}
                       </p>
                     </div>
 

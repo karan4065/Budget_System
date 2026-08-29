@@ -49,7 +49,11 @@ router.get('/stats', authMiddleware, async (req, res) => {
             fortnightAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'fortnight'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } },
             monthlyClients: { $addToSet: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$clientId', null] } },
             monthlyCount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, 1, 0] } },
-            monthlyAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } }
+            monthlyAmount: { $sum: { $cond: [{ $and: [{ $eq: ['$duration', 'monthly'] }, { $gt: ['$remainingAmount', 0] }, { $ne: ['$status', 'completed'] }] }, '$amountTaken', 0] } },
+            // Pending totals
+            pendingClients: { $addToSet: { $cond: [{ $gt: ['$pendingAmount', 0] }, '$clientId', null] } },
+            totalPendingAmount: { $sum: '$pendingAmount' },
+            pendingLoansCount: { $sum: { $cond: [{ $gt: ['$pendingAmount', 0] }, 1, 0] } }
           }
         }
       ]),
@@ -199,6 +203,9 @@ router.get('/stats', authMiddleware, async (req, res) => {
       overdueRecordsCount: stats.overdueRecords || 0,
       dueTodayCount: stats.dueTodayRecords || 0,
       dueTomorrowCount: stats.dueTomorrowRecords || 0,
+      pendingClientsCount: (stats.pendingClients || []).filter(Boolean).length,
+      totalPendingAmount: Number(stats.totalPendingAmount) || 0,
+      pendingLoansCount: stats.pendingLoansCount || 0,
       totalAmountGiven,
       totalPrincipal: totalAmountGiven,
       totalInterest,

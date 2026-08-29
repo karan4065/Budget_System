@@ -290,7 +290,7 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                       <div className="bg-purple-50/60 dark:bg-purple-950/30 p-2.5 rounded-lg border border-purple-200 dark:border-purple-500/30">
                         <span className="text-[10px] text-purple-700 dark:text-purple-300 uppercase font-semibold block">Total Payable</span>
                         <span className="text-sm font-bold text-purple-700 dark:text-purple-300 font-mono">
-                          {formatCurrency(activeLoan.totalPayable ?? activeLoan.total_payable ?? (Number(activeLoan.amountTaken ?? activeLoan.amount_taken ?? 0) * 1.10))}
+                          {formatCurrency(Math.max(Number(activeLoan.amountTaken ?? activeLoan.amount_taken ?? 0) * 1.10, Number(activeLoan.totalPayable ?? activeLoan.total_payable ?? 0)))}
                         </span>
                       </div>
                       <div className="bg-white dark:bg-surface-900 p-2.5 rounded-lg border border-slate-200 dark:border-surface-800">
@@ -327,13 +327,17 @@ export function SearchClient({ onOpenClientDetail, onOpenAddClient, onOpenPaymen
                         const loanSeq = client.records?.length ? (client.records.length - client.records.findIndex(r => r.id === pLoan.id)) : (pastLoans.length - i);
                         const pPrincipal = Number(pLoan.amountTaken ?? pLoan.amount_taken ?? 0);
                         const pInterest = Number(pLoan.interestAmount ?? pLoan.interest_amount ?? (pPrincipal * 0.10));
-                        const pPayable = Number(pLoan.totalPayable ?? pLoan.total_payable ?? (pPrincipal + pInterest));
+                        const pPayable = Math.max(pPrincipal + pInterest, Number(pLoan.totalPayable ?? pLoan.total_payable ?? 0));
                         const pPaid = Number(pLoan.totalPaid ?? pLoan.total_paid ?? 0);
-                        let pPending = Number(pLoan.pendingAmount ?? pLoan.pending_amount ?? 0);
-                        if (pPending <= 0 && (pLoan.status === 'completed' || Boolean(pLoan.isSettledPending)) && pPayable > pPaid) {
-                          pPending = Math.max(0, pPayable - pPaid);
+                        let pPending = 0;
+                        if (pPaid < pPayable) {
+                          if (Number(pLoan.pendingAmount ?? pLoan.pending_amount ?? 0) > 0) {
+                            pPending = Number(pLoan.pendingAmount ?? pLoan.pending_amount ?? 0);
+                          } else if (pLoan.status === 'completed' || Boolean(pLoan.isSettledPending)) {
+                            pPending = Math.max(0, pPayable - pPaid);
+                          }
                         }
-                        const isCompleted = pLoan.status === 'completed' || Boolean(pLoan.isSettledPending) || pPending > 0;
+                        const isCompleted = pLoan.status === 'completed' || Boolean(pLoan.isSettledPending) || pPaid >= pPayable;
 
                         return (
                           <div 

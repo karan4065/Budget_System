@@ -188,53 +188,30 @@ router.post('/', authMiddleware, async (req, res) => {
         note: finalNote
       });
 
-      let pendingAmountMarked = 0;
-      if (markAsPendingAndComplete && transactionType === 'payment' && !shouldExtend && projectedRemaining > 0) {
-        pendingAmountMarked = projectedRemaining;
-        // Record adjustment transaction to clear remaining balance for loan completion
-        await Transaction.create({
-          loanId: loan._id,
-          clientId: loan.clientId,
-          amount: pendingAmountMarked,
-          transactionType: 'adjustment',
-          transactionDate,
-          remainingAfter: 0,
-          paymentMode,
-          note: `Settlement Discount / Remaining ₹${pendingAmountMarked} marked as pending (Loan completed)`
-        });
-
+      if (markAsPendingAndComplete && transactionType === 'payment' && !shouldExtend) {
         await Loan.findByIdAndUpdate(loan._id, {
-          pendingAmount: pendingAmountMarked,
           isSettledPending: true,
-          remainingAmount: 0,
-          status: 'completed'
+          status: 'completed',
+          remainingAmount: 0
         });
       }
 
-      // Recalculate exact loan balance from all transactions
+      // Recalculate exact loan balance from all transactions using centralized logic
       const syncResult = await syncLoanBalances(loan._id);
-
-      if (markAsPendingAndComplete && pendingAmountMarked > 0) {
-        await Loan.findByIdAndUpdate(loan._id, {
-          pendingAmount: pendingAmountMarked,
-          isSettledPending: true,
-          remainingAmount: 0,
-          status: 'completed'
-        });
-      }
+      const pendingAmount = Number(syncResult?.pendingAmount || 0);
 
       return res.status(201).json({
-        message: markAsPendingAndComplete && pendingAmountMarked > 0
-          ? `Payment of ₹${parsedAmount} recorded and loan completed with ₹${pendingAmountMarked} marked as pending.`
+        message: markAsPendingAndComplete && pendingAmount > 0
+          ? `Payment of ₹${parsedAmount} recorded and loan completed with ₹${pendingAmount} marked as pending.`
           : shouldExtend
           ? `Interest payment recorded! Loan cycle renewed until ${newDueDate}.`
           : 'Transaction recorded successfully',
         txnId: txn._id.toString(),
         newDueDate,
         newTotalPaid: syncResult?.totalPaid ?? (Number(loan.totalPaid) + parsedAmount),
-        newRemaining: markAsPendingAndComplete ? 0 : (syncResult?.remainingAmount ?? projectedRemaining),
-        newStatus: markAsPendingAndComplete ? 'completed' : (syncResult?.status || evaluateStatus(projectedRemaining, newDueDate)),
-        pendingAmount: pendingAmountMarked
+        newRemaining: syncResult?.remainingAmount ?? 0,
+        newStatus: syncResult?.status || 'active',
+        pendingAmount
       });
     } catch (err) {
       console.error('Error adding transaction:', err);
