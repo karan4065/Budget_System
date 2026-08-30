@@ -97,6 +97,34 @@ export function ClientLists({
     setReminderChooserData({ loanId, clientName, mobileNumber });
   };
 
+  const isDueTomorrow = activeDuration === 'due-tomorrow' || activeDuration === 'due_tomorrow';
+
+  const handleToggleReminder = async (client) => {
+    const loanId = client.latestRecordId;
+    if (!loanId) return;
+
+    const currentStatus = Boolean(client.reminderSent);
+    const newStatus = !currentStatus;
+
+    // Optimistically update UI
+    setClients(prev => prev.map(c => 
+      c.id === client.id 
+        ? { ...c, reminderSent: newStatus, lastReminderSentAt: newStatus ? new Date().toISOString() : null } 
+        : c
+    ));
+
+    try {
+      await api.toggleLoanReminderStatus(loanId, newStatus);
+      success(newStatus ? `Reminder marked as sent for ${client.name}` : `Reminder mark removed for ${client.name}`);
+    } catch (err) {
+      // Revert on error
+      setClients(prev => prev.map(c => 
+        c.id === client.id ? { ...c, reminderSent: currentStatus } : c
+      ));
+      error(err.message || 'Failed to update reminder status');
+    }
+  };
+
   const handleTriggerReminder = async (loanId, channel = 'whatsapp') => {
     if (!loanId) return;
     setSendingReminderId(loanId);
@@ -139,14 +167,20 @@ export function ClientLists({
 
   const handleConfirmReminderSent = async () => {
     if (!pendingReminder) return;
+    const confirmedLoanId = pendingReminder.loanId;
     setConfirmingReminder(true);
     try {
-      const res = await api.confirmReminderLog(pendingReminder.loanId, {
+      const res = await api.confirmReminderLog(confirmedLoanId, {
         messageText: pendingReminder.messageText,
         reminderType: pendingReminder.reminderType,
         channel: pendingReminder.channel
       });
       success(res.message || `${pendingReminder.channel === 'sms' ? 'SMS' : 'WhatsApp'} reminder confirmed (+1)!`);
+      setClients(prev => prev.map(c => 
+        (c.latestRecordId === confirmedLoanId || c.id === confirmedLoanId)
+          ? { ...c, reminderSent: true, lastReminderSentAt: new Date().toISOString() }
+          : c
+      ));
       setPendingReminder(null);
       triggerRefresh();
       fetchClients();
@@ -357,6 +391,9 @@ export function ClientLists({
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-100 dark:bg-surface-950/80 border-b border-slate-200 dark:border-surface-800 text-slate-500 dark:text-slate-400 uppercase font-semibold tracking-wider">
                   <tr>
+                    {isDueTomorrow && (
+                      <th className="px-4 py-3.5 text-center whitespace-nowrap w-16" title="Reminder Sent Status">Status</th>
+                    )}
                     <th className="px-5 py-3.5 whitespace-nowrap">Client Details</th>
                     <th className="px-5 py-3.5 whitespace-nowrap">Amount Taken</th>
                     <th className="px-5 py-3.5 whitespace-nowrap">Start Date</th>
@@ -377,6 +414,43 @@ export function ClientLists({
                       className="hover:bg-slate-50 dark:hover:bg-surface-800/40 transition-colors group cursor-pointer"
                       onClick={() => onOpenClientDetail(client.id)}
                     >
+                      {/* Reminder Tickmark Status (Only on Due Tomorrow page) */}
+                      {isDueTomorrow && (
+                        <td 
+                          className="px-4 py-4 text-center whitespace-nowrap"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleReminder(client);
+                          }}
+                        >
+                          {client.reminderSent ? (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleToggleReminder(client);
+                              }}
+                              title={`Reminder sent${client.lastReminderSentAt ? ` (${formatDate(client.lastReminderSentAt)})` : ''}. Click to toggle.`}
+                              className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 hover:scale-110 active:scale-95 transition-all shadow-sm group"
+                            >
+                              <Check className="w-4 h-4 stroke-[3]" />
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleToggleReminder(client);
+                              }}
+                              title="Reminder not sent yet. Click to mark as sent."
+                              className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-slate-100 dark:bg-surface-800/80 border border-slate-200 dark:border-surface-700 text-slate-300 dark:text-slate-600 hover:text-slate-400 hover:border-slate-300 dark:hover:border-surface-600 hover:scale-110 active:scale-95 transition-all group"
+                            >
+                              <span className="text-sm font-bold leading-none select-none">—</span>
+                            </button>
+                          )}
+                        </td>
+                      )}
+
                       {/* Name & Mobile */}
                       <td className="px-5 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-3">
@@ -515,22 +589,45 @@ export function ClientLists({
                 >
                   {/* Top Bar: Name, Status & Mobile */}
                   <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h3 className="font-bold text-base text-slate-900 dark:text-white">{client.name}</h3>
-                        <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 dark:bg-surface-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-surface-700">
-                          #{client.displayId || client.clientNo || client.id}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-500 dark:text-slate-400 font-mono">
-                        <a 
-                          href={`tel:${client.mobileNumber}`} 
-                          onClick={(e) => e.stopPropagation()}
-                          className="flex items-center gap-1 text-brand-600 dark:text-brand-400 hover:underline"
+                    <div className="flex items-center gap-2.5">
+                      {isDueTomorrow && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleReminder(client);
+                          }}
+                          className="flex-shrink-0"
+                          title={client.reminderSent ? "Reminder sent. Click to toggle." : "Reminder not sent. Click to mark."}
                         >
-                          <Phone className="w-3 h-3" />
-                          <span>+91 {client.mobileNumber}</span>
-                        </a>
+                          {client.reminderSent ? (
+                            <div className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400">
+                              <Check className="w-4 h-4 stroke-[3]" />
+                            </div>
+                          ) : (
+                            <div className="inline-flex items-center justify-center w-7 h-7 rounded-full bg-slate-100 dark:bg-surface-800 border border-slate-200 dark:border-surface-700 text-slate-300 dark:text-slate-600 font-bold text-xs">
+                              —
+                            </div>
+                          )}
+                        </button>
+                      )}
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <h3 className="font-bold text-base text-slate-900 dark:text-white">{client.name}</h3>
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-100 dark:bg-surface-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-surface-700">
+                            #{client.displayId || client.clientNo || client.id}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-500 dark:text-slate-400 font-mono">
+                          <a 
+                            href={`tel:${client.mobileNumber}`} 
+                            onClick={(e) => e.stopPropagation()}
+                            className="flex items-center gap-1 text-brand-600 dark:text-brand-400 hover:underline"
+                          >
+                            <Phone className="w-3 h-3" />
+                            <span>+91 {client.mobileNumber}</span>
+                          </a>
+                        </div>
                       </div>
                     </div>
 

@@ -293,6 +293,20 @@ router.get('/', authMiddleware, async (req, res) => {
       .limit(Number(limit))
       .lean();
 
+    // Query sent reminders for these loans to accurately know reminder history
+    const loanIds = loans.map(l => l._id);
+    const sentReminders = await Reminder.find({
+      loanId: { $in: loanIds },
+      status: 'sent'
+    }).select('loanId sentAt channel reminderType').lean();
+
+    const reminderMap = new Map();
+    for (const r of sentReminders) {
+      if (!reminderMap.has(r.loanId.toString())) {
+        reminderMap.set(r.loanId.toString(), r);
+      }
+    }
+
     const formatted = loans.map(loan => {
       const client = loan.clientId || {};
       const principal = Number(loan.amountTaken) || 0;
@@ -309,6 +323,10 @@ router.get('/', authMiddleware, async (req, res) => {
         overdueWeeks = Math.ceil(daysOverdue / 7);
       }
 
+      const hasReminder = loan.reminderSent !== undefined && loan.reminderSent !== null
+        ? Boolean(loan.reminderSent)
+        : reminderMap.has(loan._id.toString());
+
       return {
         id: client._id?.toString() || loan._id.toString(),
         clientNo: client.clientNo || client._id?.toString(),
@@ -321,6 +339,8 @@ router.get('/', authMiddleware, async (req, res) => {
         notes: client.notes || '',
         createdAt: client.createdAt,
         latestRecordId: loan._id.toString(),
+        reminderSent: hasReminder,
+        lastReminderSentAt: loan.lastReminderSentAt || reminderMap.get(loan._id.toString())?.sentAt || null,
         amountTaken: principal,
         interestRate: rate,
         interestAmount: Number(loan.interestAmount) || baseInterest,
@@ -1043,6 +1063,33 @@ router.put('/loans/:id', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Error updating loan:', err);
     return res.status(500).json({ error: 'Failed to update loan: ' + err.message });
+  }
+});
+
+// ─── PATCH /api/clients/loans/:id/reminder-status ─────────────────────────────
+router.patch('/loans/:id/reminder-status', authMiddleware, async (req, res) => {
+  const loanId = req.params.id;
+  const { reminderSent } = req.body;
+
+  try {
+    if (!mongoose.Types.ObjectId.isValid(loanId)) return res.status(400).json({ error: 'Invalid loan ID.' });
+    const loan = await Loan.findById(loanId);
+    if (!loan) return res.status(404).json({ error: 'Loan record not found.' });
+
+    const newReminderSent = reminderSent !== undefined ? Boolean(reminderSent) : !loan.reminderSent;
+    loan.reminderSent = newReminderSent;
+    loan.lastReminderSentAt = newReminderSent ? new Date() : null;
+    await loan.save();
+
+    return res.json({
+      success: true,
+      loanId: loan._id.toString(),
+      reminderSent: loan.reminderSent,
+      lastReminderSentAt: loan.lastReminderSentAt
+    });
+  } catch (err) {
+    console.error('Error updating loan reminder status:', err);
+    return res.status(500).json({ error: 'Failed to update reminder status: ' + err.message });
   }
 });
 

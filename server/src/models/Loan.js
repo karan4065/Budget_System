@@ -15,6 +15,8 @@ const loanSchema = new mongoose.Schema({
   status: { type: String, enum: ['active', 'completed', 'overdue'], default: 'active', index: true },
   pendingAmount: { type: Number, default: 0 },
   isSettledPending: { type: Boolean, default: false },
+  reminderSent: { type: Boolean, default: false },
+  lastReminderSentAt: { type: Date, default: null },
   note: { type: String, default: null }
 }, { timestamps: true });
 

@@ -219,6 +219,11 @@ router.post('/:loanId/confirm', authMiddleware, async (req, res) => {
       errorMessage: null
     });
 
+    await Loan.findByIdAndUpdate(loanId, {
+      reminderSent: true,
+      lastReminderSentAt: new Date()
+    });
+
     const channelLabel = channel === 'sms' ? 'SMS' : 'WhatsApp';
     return res.json({
       success: true,

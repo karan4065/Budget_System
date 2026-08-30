@@ -83,6 +83,10 @@ export const api = {
     method: 'PUT',
     body: JSON.stringify(data)
   }),
+  toggleLoanReminderStatus: (id, reminderSent) => request(`/clients/loans/${id}/reminder-status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ reminderSent })
+  }),
   deleteLoan: (id) => request(`/clients/loans/${id}`, {
     method: 'DELETE'
   }),
